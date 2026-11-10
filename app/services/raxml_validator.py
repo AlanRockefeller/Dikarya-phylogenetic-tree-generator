@@ -1,9 +1,10 @@
+import json
 import math
 import re
 import random
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Constants
 MIN_BOOTSTRAP_CAP = 100
@@ -47,6 +48,44 @@ DEFAULT_BOOTSTRAP_CUTOFF = 0.07
 LEGACY_BOOTSTRAP_CUTOFF = 0.03
 MIN_BOOTSTRAP_CUTOFF = 0.01
 MAX_BOOTSTRAP_CUTOFF = 0.10
+
+
+def stored_bootstrap_cutoff(params: Dict[str, Any], job_dir: Optional[Path] = None):
+    """Recover an omitted cutoff from this job's run before using the legacy default.
+
+    Early public-API jobs ran the new default without saving it in input_info.
+    Their tree metadata records the actual cutoff. Explicit saved values and
+    recompute overrides take precedence; jobs with no recorded cutoff used 0.03.
+    """
+    if "bootstrap_cutoff" in params:
+        return params["bootstrap_cutoff"]
+    recorded_by_current_code = False
+    if job_dir is not None:
+        from app.services.artifact_storage import open_artifact
+
+        for filename in ("tree_pruned_metadata.json", "tree_metadata.json"):
+            try:
+                with open_artifact(Path(job_dir) / "tree" / filename, "rt") as handle:
+                    metadata = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if (isinstance(metadata, dict)
+                    and str(metadata.get("method", "")).lower() == "raxml"
+                    and "bootstrap_cutoff" in metadata):
+                cutoff = metadata["bootstrap_cutoff"]
+                if cutoff:
+                    return cutoff
+                applied = metadata.get("parameters_applied")
+                if isinstance(applied, dict) and applied.get("enable_bootstrap") is False:
+                    # None because no bootstrap ran, so no cutoff did either.
+                    # The key's presence still dates the job to after the
+                    # setting existed; look further, then use today's default.
+                    recorded_by_current_code = True
+                    continue
+                # None with bootstrapping on records a binary without
+                # --bs-cutoff support, whose built-in 0.03 was used instead.
+                return LEGACY_BOOTSTRAP_CUTOFF
+    return DEFAULT_BOOTSTRAP_CUTOFF if recorded_by_current_code else LEGACY_BOOTSTRAP_CUTOFF
 
 
 def bootstrap_cutoff_label(cutoff) -> str:
@@ -293,6 +332,12 @@ class ResolvedRaxmlParams:
     enable_moose: bool = False
     enable_early_stopping: bool = False
     bootstrap_cutoff: float = DEFAULT_BOOTSTRAP_CUTOFF
+    # Alan 11/8/26 - The entries of ``warnings`` that never reduce the work done
+    # (a policy that makes the search MORE thorough than asked). They stay in
+    # ``warnings`` so users still see them, but they are not DEGRADED: the
+    # publication-preset early-stopping note was the only thing that had ever
+    # triggered raxml_parameters_adjusted.
+    notices: list[str] = field(default_factory=list)
 
 
 def resolve_outgroup_id(outgroup: str, name_mapping: Dict[str, str]) -> str:
@@ -590,8 +635,11 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
     enable_early_stopping = bool(params.get('enable_early_stopping', params.get('early_stopping', False)))
     
     # Force default OFF for high-quality presets
+    notices = []
     if run_preset in ('publication', 'maximum') and enable_early_stopping:
-        warnings.append(f"Early stopping disabled for '{run_preset}' quality to ensure thorough search.")
+        note = f"Early stopping disabled for '{run_preset}' quality to ensure thorough search."
+        warnings.append(note)
+        notices.append(note)
         enable_early_stopping = False
 
     return ResolvedRaxmlParams(
@@ -606,4 +654,5 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
         enable_moose=enable_moose,
         enable_early_stopping=enable_early_stopping,
         bootstrap_cutoff=bootstrap_cutoff,
+        notices=notices,
     )

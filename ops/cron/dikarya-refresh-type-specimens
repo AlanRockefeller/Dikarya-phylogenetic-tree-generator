@@ -15,6 +15,10 @@
 #              refuses a snapshot >10% smaller than the last one
 #   - genbank  asks NCBI about RefSeq NR_ and type-labelled accessions in jobs
 #              from the last 8 days that neither source knows yet
+#   - curation asks MycoMap.org's genbank-curation endpoint about every
+#              accession in jobs from the last 8 days (~14,000, ~140 requests)
+#              and records the types curators flagged there; paced 30 s apart
+#              because MycoMap.org rate-limits the endpoint (~75 minutes)
 # Exits 1 if a pass failed; the previous data stays in place.
 
 SHELL=/bin/bash

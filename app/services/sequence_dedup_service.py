@@ -718,7 +718,53 @@ def apply_observation_dedup(
     )
     if not removed:
         return 0
+    outgroup = job_params.get("outgroup")
+    followed = _outgroup_after_dedup(outgroup, job_params.get("sequence", ""), removed)
     job_params["sequence"] = text
     job_params["sequence_metadata"] = metadata
     record_dedup_details(job_params, removed)
+    if followed and followed != outgroup:
+        logger.info(
+            "event=dedup.outgroup_followed The outgroup record was merged by dedup; "
+            "rooting on the record that now carries it."
+        )
+        job_params["outgroup"] = followed
     return len(removed)
+
+
+def _outgroup_after_dedup(outgroup: Any, sequence_text: str,
+                          removed: List[Dict[str, Any]]) -> Optional[str]:
+    """The label the outgroup's record carries after a dedup pass, or None.
+
+    The outgroup is stored as the label the user picked and is matched the way
+    raxml_validator.resolve_outgroup_id() matches it at submission. Dedup can
+    drop that record in favour of a longer read of the same observation or
+    accession, or relabel a kept one to carry the identifiers folded into it.
+    Either left the stored outgroup naming nothing, and the job failed at the
+    tree step, after alignment (g9g6 and qpru on 2026-10-29: an outgroup fetched
+    by accession and collapsed into the MycoMap hit for the same accession).
+
+    ``sequence_text`` is the payload BEFORE this pass, so the record is resolved
+    exactly as submission validation resolved it. None means nothing to follow:
+    no outgroup, one that never resolved, or a record this pass left alone.
+    """
+    if not isinstance(outgroup, str) or not outgroup.strip():
+        return None
+    from app.services.fasta_utils import parse_fasta_records
+    from app.services.raxml_validator import resolve_outgroup_id
+
+    headers = [header for header, _seq in parse_fasta_records(sequence_text or "")]
+    try:
+        index = resolve_outgroup_id(outgroup.strip(), {
+            str(i): header for i, header in enumerate(headers)
+        })
+    except ValueError:
+        return None
+    target = headers[int(index)]
+    for record in removed:
+        if record.get("name") == target:
+            return record.get("duplicate_of") or None
+    for record in removed:
+        if record.get("kept_original_name") == target:
+            return record.get("merged_into_label") or None
+    return None

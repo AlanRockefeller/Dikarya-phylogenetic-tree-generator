@@ -85,6 +85,11 @@ MYCOMAP_NCBI_RERUN_WAIT_SECONDS = 600
 MYCOMAP_NCBI_POLL_INTERVAL_SECONDS = 60
 MYCOMAP_NCBI_POLL_MAX_ATTEMPTS = 120
 MYCOMAP_NCBI_LOCAL_FALLBACK_SECONDS = 600
+# Alan 10/24/26 - MycoMap.org now answers a local BLAST from its own database
+# in seconds instead of going to NCBI, so a deferred MycoMap.org rerun is
+# checked every 15 s rather than every minute. The total wait stays two hours.
+MYCOMAP_ORG_RERUN_POLL_INTERVAL_SECONDS = 15
+MYCOMAP_ORG_RERUN_WAIT_MAX_SECONDS = 2 * 60 * 60
 MYCOMAP_NCBI_BACKLOG_FALLBACK_POSITION = 100
 MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # How long to keep looking for a newly created BLAST's result page before
@@ -525,6 +530,22 @@ def get_mycomap_ncbi_poll_max_attempts() -> int:
         min_value=1,
         max_value=720,
     )
+
+
+def get_mycomap_org_rerun_poll_interval_seconds() -> int:
+    """Return the deferred-check interval for a MycoMap.org BLAST rerun."""
+    return _env_int(
+        "MYCOMAP_ORG_RERUN_POLL_INTERVAL_SECONDS",
+        MYCOMAP_ORG_RERUN_POLL_INTERVAL_SECONDS,
+        min_value=5,
+        max_value=300,
+    )
+
+
+def get_mycomap_org_rerun_poll_max_attempts() -> int:
+    """Return how many deferred checks fit in the MycoMap.org rerun budget."""
+    interval = get_mycomap_org_rerun_poll_interval_seconds()
+    return max(1, -(-MYCOMAP_ORG_RERUN_WAIT_MAX_SECONDS // interval))
 
 
 def get_mycomap_ncbi_local_fallback_seconds() -> int:
@@ -2240,6 +2261,46 @@ def parse_mycomap_result_reference(url: str) -> Optional[dict]:
     return None
 
 
+def fetch_mycomap_result_title(url: str, timeout: Optional[float] = None) -> str:
+    """Return a public MycoMap result page's HTML title, best effort.
+
+    This is intentionally a small head read. The iNaturalist tree importer
+    uses it only when an observation field contains more than one MycoMap
+    result link and the URL itself does not say which locus was searched.
+    Unsupported hosts are rejected before any request is made. ``timeout``
+    (default REQUEST_TIMEOUT) lets a caller inside a request budget pass what
+    is left of it.
+    """
+    if not parse_mycomap_result_reference(url):
+        return ""
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Dikarya-TreeBuilder/1.0",
+            "Accept": "text/html,*/*",
+        },
+        method="GET",
+    )
+    try:
+        with diagnostic_urlopen(
+            request, timeout=REQUEST_TIMEOUT if timeout is None else timeout,
+        ) as response:
+            # MycoMap puts <title> in the first few KB; leave ample room for
+            # harmless head markup without downloading the much larger result
+            # tables.
+            head = response.read(65536).decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.info("Could not read MycoMap result title from %s: %s", url, exc)
+        return ""
+
+    match = re.search(r"<title[^>]*>(.*?)</title>", head,
+                      re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return " ".join(html.unescape(match.group(1)).split())
+
+
 def resolve_mycomap_result_reference(url: str) -> Optional[dict]:
     """Return the provider and BLAST ID, resolving org sequence links if needed."""
     reference = parse_mycomap_result_reference(url)
@@ -3215,10 +3276,27 @@ def _parse_blast_metrics_table(rows: list) -> dict:
             subject_cover = abs(subject_cover)
         return query_cover, subject_cover
 
+    # Alan 11/9/26 - A local-results table (it has a Source column) is also keyed
+    # by each row's exact description, so a curator-labelled local record can
+    # match its OWN row instead of borrowing another hit's numbers through a
+    # token in its label. A description shared by two rows is ambiguous and
+    # is not registered.
+    description_counts = {}
+    if source_col is not None and desc_col is not None:
+        for row in rows[header_idx + 1:]:
+            if len(row) > desc_col:
+                key = local_row_description_key(row[desc_col])
+                description_counts[key] = description_counts.get(key, 0) + 1
+
     result = {}
     for row in rows[header_idx + 1:]:
         if len(row) <= ident_col:
             continue
+        own_key = ''
+        if source_col is not None and desc_col is not None and len(row) > desc_col:
+            own_key = local_row_description_key(row[desc_col])
+            if description_counts.get(own_key) != 1:
+                own_key = ''
         metric_keys = []
         primary_identifier = ''
         for hit_col in hit_cols:
@@ -3243,7 +3321,7 @@ def _parse_blast_metrics_table(rows: list) -> dict:
                     continue
                 metric_keys.extend(build_blast_metric_keys(cell))
         metric_keys = _unique_metric_keys(metric_keys)
-        if not metric_keys:
+        if not metric_keys and not own_key:
             continue
         identity = _to_float(row[ident_col] if len(row) > ident_col else None)
         query_cover, subject_cover = _cover_values(row)
@@ -3262,10 +3340,31 @@ def _parse_blast_metrics_table(rows: list) -> dict:
             ),
         }
         metric.update(display_info)
+        if source_col is not None:
+            # The Accession column holds MycoMap's own record ID here, and the
+            # Source column the dataset a curator record came from (an
+            # "<observation> - <taxon>" Source is an observation, not a dataset).
+            record_id = str(primary_identifier or '').strip()
+            if record_id:
+                metric['mycomap_record_id'] = record_id[:100]
+            source_text = _clean_label_fragment(row[source_col] if len(row) > source_col else '')
+            if source_text and not re.match(r'^\d{1,12}\s*[-‐-―]\s*', source_text):
+                metric['mycomap_dataset'] = source_text[:300]
         for key in metric_keys:
             result.setdefault(key, metric)
+        if own_key:
+            result.setdefault(own_key, metric)
 
     return result
+
+
+LOCAL_ROW_DESCRIPTION_PREFIX = 'local-row-description:'
+
+
+def local_row_description_key(text) -> str:
+    """Lookup key for a local results-table row by its exact description."""
+    normalized = ' '.join(html.unescape(str(text or '')).lstrip('>').split())
+    return f"{LOCAL_ROW_DESCRIPTION_PREFIX}{normalized}" if normalized else ''
 
 
 def _normalize_header_cell(value: str) -> str:
@@ -3393,10 +3492,67 @@ def _compact_ncbi_description(description: str) -> str:
 def _infer_species_name(description: str) -> str:
     """Infer a binomial-style species name from a BLAST description."""
     text = _compact_ncbi_description(description)
-    match = re.match(r'^([A-Z][a-zA-Z-]+)\s+([a-z][a-zA-Z-]+|["\'][^"\']+["\'])\b', text)
+    # Alan 11/9/26 - Keep a "cf"/"aff"/"nr" qualifier as written: "Hygrocybe cf
+    # minutula" used to come out as the name "Hygrocybe cf".
+    match = re.match(
+        r'^([A-Z][a-zA-Z-]+)\s+(?:((?:cf|aff|nr)\.?)\s+)?'
+        r'([a-z][a-zA-Z-]+|["\'][^"\']+["\'])\b',
+        text,
+    )
     if not match:
         return ''
-    return _clean_label_fragment(' '.join(match.groups()))
+    return _clean_label_fragment(' '.join(part for part in match.groups() if part))
+
+
+_CURATOR_QUALIFIER_RE = re.compile(r'^(?:cf|aff|nr)\.?$', re.IGNORECASE)
+_UNITE_ACCESSION_RE = re.compile(r'^UDB\d{6,8}$')
+
+
+def _header_unite_identifier(tokens: list) -> str:
+    """UNITE accession(s) a curator header names outside its notes, or ''."""
+    found = []
+    for token in _strip_header_notes(' '.join(tokens)).split():
+        candidate = token.strip('>,;()[]{}')
+        if _UNITE_ACCESSION_RE.match(candidate) and candidate not in found:
+            found.append(candidate)
+    return ' '.join(found)
+
+
+_CURATOR_TYPE_WORD_RE = re.compile(r'^(?:holo|iso|para|epi|neo|lecto|syn)?type$', re.IGNORECASE)
+
+
+def _curator_type_word(tokens: list) -> str:
+    """A type status a curator wrote outside the notes ("HOLOTYPE"), or ''.
+
+    Alan 11/9/26 - A curator record has no accession for the type-specimen
+    marker to match, so its own "HOLOTYPE" is the only sign it is one. Inside
+    a note ("(type NY)", "(... ITS1 TYPE)") the word is about another record.
+    """
+    for token in _strip_header_notes(' '.join(tokens)).split():
+        word = token.strip('>,;()[]{}')
+        if _CURATOR_TYPE_WORD_RE.match(word.rstrip('.')):
+            return word.rstrip('.')
+    return ''
+
+
+def _with_curator_qualifier(tokens: list, species_name: str) -> str:
+    """Put a curator's "cf"/"aff"/"nr" back into MycoMap's name for the record.
+
+    Alan 11/9/26 - A curator writes "Hygrocybe cf minutula" on purpose; the
+    label used to show MycoMap's "Hygrocybe minutula", which reads as a
+    confident identification. Only re-added when the qualifier precedes this
+    same epithet, so it never qualifies a name the curator did not write.
+    """
+    parts = species_name.split()
+    if len(parts) < 2 or any(_CURATOR_QUALIFIER_RE.match(part) for part in parts):
+        return species_name
+    words = _strip_header_notes(' '.join(tokens)).split()
+    epithet = parts[1].strip('\'"').casefold()
+    for index, word in enumerate(words[:-1]):
+        if (_CURATOR_QUALIFIER_RE.match(word)
+                and words[index + 1].strip('\'",;').casefold() == epithet):
+            return ' '.join([parts[0], word] + parts[1:])
+    return species_name
 
 
 def describe_ncbi_hit(accession: str, raw_description: str) -> dict:
@@ -3614,9 +3770,12 @@ def _build_result_display_info(description: str, identifier: str = '',
         compact_description = _compact_ncbi_description(text)
         if species_name and compact_description:
             display_name = _clean_label_fragment(' '.join(part for part in (identifier, compact_description) if part))
+            # Alan 11/9/26 - Inferred from free text, not MycoMap's name badge,
+            # so a matched observation or GenBank row's name may replace it.
             return {
                 'species_name': species_name,
                 'display_name': display_name,
+                'species_from_label': True,
             }
         return {}
 
@@ -3631,9 +3790,59 @@ def _build_result_display_info(description: str, identifier: str = '',
     return result
 
 
+def _strip_header_notes(text: str) -> str:
+    """Remove parenthetical and bracketed notes, innermost first."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r'\([^()]*\)|\[[^\[\]]*\]', ' ', text)
+    return text
+
+
+def _header_accession_identifier(tokens: list, voucher: str = '') -> str:
+    """Return the accession(s) a local hit header names, or ''.
+
+    Shape alone cannot tell an accession from a herbarium number: NYBG's
+    "NY00123456" is a valid 2+8 accession shape and UBC's "F19990" a valid 1+5
+    one, and a local hit has no structured accession or voucher to check
+    against. Alan 11/8/26 - Two signals in the header are reliable, and the
+    "last token wins" rule this replaces picked a herbarium number in two of
+    the three real curator headers with more than one candidate:
+
+    - a note in parentheses or brackets is about some other record ("(match to
+      dirty holotype PX412020)", "(F17170 OC98)"), so nothing inside one is
+      this record's accession -- taking PX412020 would mark the tip a type;
+    - a token of a known voucher is never the accession.
+
+    If more than one candidate is still left, which one is this record's own
+    cannot be known, so all are kept in header order rather than one guessed:
+    "... HQ604846 F19990 MO67832 Vict" -> "HQ604846 F19990".
+    """
+    from app.services.fasta_utils import is_genbank_accession
+
+    voucher_tokens = {
+        part.strip('>,;()[]{}').casefold() for part in str(voucher or '').split()
+    }
+    found = []
+    seen = set()
+    for token in _strip_header_notes(' '.join(tokens)).split():
+        candidate = token.strip('>,;()[]{}')
+        if candidate.casefold() in voucher_tokens:
+            continue
+        if not (re.search(r'\d', candidate) and is_genbank_accession(candidate)):
+            continue
+        # "KM248898 KM248898.1" names one record, not two.
+        key = candidate.split('.', 1)[0].casefold()
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+    return ' '.join(found)
+
+
 def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
                                    hit_source: str = '', *, accession: str = '',
-                                   voucher: str = '', location: str = '') -> str:
+                                   voucher: str = '', location: str = '',
+                                   mycomap_record_id: str = '') -> str:
     """
     Use MycoMap table metadata to repair stale or sparse FASTA headers.
 
@@ -3641,31 +3850,66 @@ def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
     when the BLAST results table has "Species Name: Ascobolus equinus". Local
     FASTA headers can also retain an outdated source taxon after the current
     MycoMap species name has changed.
+
+    ``mycomap_record_id`` is MycoMap's ID for a local record, passed only when
+    the record matched its own results row; it labels a curator record whose
+    header names nothing a reader could look up.
     """
     if not metric:
         return current_name
 
     display_name = metric.get('display_name') or ''
     species_name = metric.get('species_name') or ''
-    if not species_name:
-        return current_name
     if hit_source == 'local':
         identifier = str(current_name or '').lstrip('>').strip().split()
         if not identifier:
+            return current_name
+        # Alan 11/9/26 - A header that leads with a word rather than an ID was
+        # written by a curator. Its identifier is, in order: a GenBank
+        # accession, a UNITE accession, else MycoMap's record ID; an
+        # observation it names is already something a reader can open.
+        curator = not re.search(r'\d', identifier[0])
+        lookup_id = ''
+        if curator:
+            lookup_id = (_header_accession_identifier(identifier[1:], voucher)
+                         or _header_unite_identifier(identifier[1:]))
+        fallback_id = f"MycoMap#{mycomap_record_id}" if mycomap_record_id else ''
+        if not species_name:
+            if (curator and fallback_id and not lookup_id
+                    and not extract_mycomap_observation_reference(current_name)):
+                return _clean_label_fragment(f"{fallback_id} {current_name}")
             return current_name
         observation_ids = extract_inaturalist_observation_ids(current_name)
         label_identifier = identifier[0]
         if observation_ids:
             inat_token = f"iNat{observation_ids[0]}"
             species_token = species_name.split()[0] if species_name.split() else ''
-            if label_identifier.casefold() == species_token.casefold():
+            # Alan 11/9/26 - A curator header's first word is never an ID, even
+            # when it differs from the name used: keeping it produced
+            # "Pholiotina iNat17859197 Hypholoma dispersum".
+            if curator or label_identifier.casefold() == species_token.casefold():
                 label_identifier = inat_token
             elif label_identifier.casefold() != inat_token.casefold():
                 label_identifier = f"{label_identifier} {inat_token}"
+        elif not re.search(r'\d', label_identifier):
+            # A curator-written header such as "Hygrocybe cf minutula QC (type
+            # NY) KM248898" leads with the genus and puts the accession last;
+            # taking the first word produced "Hygrocybe Hygrocybe minutula".
+            # Alan 11/9/26 - The first word is the genus (or an abbreviation of
+            # it, "P. Pluteus ..."), never an identifier, so it is not kept:
+            # "Entoloma undulatosporum", not "Entoloma Entoloma ...".
+            label_identifier = lookup_id or fallback_id
+        if curator:
+            species_name = _with_curator_qualifier(identifier, species_name)
+            type_word = _curator_type_word(identifier[1:])
+            if type_word and type_word.casefold() not in species_name.casefold().split():
+                species_name = f"{species_name} {type_word}"
         location = metric.get('mycomap_location') or ''
         return _clean_label_fragment(
             ' '.join(part for part in (label_identifier, species_name, location) if part)
         )
+    if not species_name:
+        return current_name
     if hit_source and hit_source != 'ncbi':
         return current_name
     if not display_name:

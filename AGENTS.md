@@ -540,6 +540,17 @@ When a new CLI version is published:
    `npx --no-install eslint app/static/js/inat_finder.js`, and spot-check the
    affected modes against live iNaturalist API responses before deploying.
 
+- **Rare Finds (`/rare-finds`) runs in the browser, like iNat Finder.**
+  `app/static/js/rare_finds.js` reads an iNaturalist search URL, ranks its
+  species-level taxa by live worldwide observation count (the taxon objects'
+  cached `observations_count` is stale for renamed taxa, so the shown list is
+  always re-counted) and builds the .pptx client-side with the vendored
+  `vendor/pptxgen-3.12.0.bundle.js`. The one server piece is
+  `/rare-finds/photo/<id>/<size>.<ext>`, which relays all-rights-reserved photos
+  because `static.inaturalist.org` sends no CORS header. It rebuilds the
+  upstream URL from validated parts and must stay that narrow -- never accept
+  a URL or host from the client. `?url=<search>` runs a search on load, so a
+  result can be shared as a link.
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
@@ -724,14 +735,57 @@ When a new CLI version is published:
   view page and this image: Twitterbot honours robots.txt, so without it no
   tree link showed a card on X. Inspect or redraw one job's card with
   `scripts/dikarya_social_preview.py <job_id> [--out f.png | --force]`.
-- **Type-specimen tips are marked from two sources, by exact accession only.**
+- **MycoMap's names always override GenBank's.** MycoMap.org is curated on
+  top of GenBank, and a misidentified GenBank record can only be corrected
+  there (OP739129 is filed as *Podaxis pistillaris* and is the *P. inyoensis*
+  holotype). `fetch_fasta_for_accessions()` in `blast_service.py` -- the one
+  path every GenBank-fetched label goes through: the Tree Builder's accession
+  box, the viewer's Add Sequences, v1 `tools/genbank`, Dikarya's own NCBI BLAST
+  hits -- swaps the organism for the `scientificName` from MycoMap.org's public
+  `POST /api/mycoblast/genbank-curation`, as the mycomap.org BLAST import
+  already did. Best effort, capped at `MYCOMAP_CURATION_BUDGET_SECONDS`; GenBank's
+  name stands if MycoMap.org cannot answer. `tests/conftest.py` stubs the
+  lookup out, so the suite never reaches mycomap.org.
+  **`genbank-curation` is rate-limited per client** (~30 requests per 10
+  minutes from this host; a 429 says "Too many GenBank lookups" with a
+  `Retry-After` of several minutes). A 429 sets the Redis key
+  `CURATION_PAUSE_KEY` for that long and every process skips the lookup until
+  it expires, so live labels fall back to GenBank's names during the wait.
+  MycoMap.org PR #17 exempts a key an admin has marked at `/admin/api-keys`:
+  `curated_genbank_rows()` sends `MYCOMAP_ORG_API_KEY` in `X-API-Key` whenever
+  the process has it (web and worker units do; the `tree` user's cron does
+  not, so the weekly pass stays anonymous and paced), and an exempt answer
+  carries `X-MycoMap-Rate-Limit: exempt`. A 401 (invalid key) or 403
+  (pending/disabled) logs `event=mycomap_org.auth_refused`, sets
+  `CURATION_KEY_REFUSED_KEY` for 10 minutes and re-asks anonymously -- the key
+  is an optimisation, never a reason to lose curated names. MycoMap.org drops
+  accessions past 500 per request without an error; Dikarya sends 100.
+  Anything that calls it in bulk must pace itself -- the refresh's `curation`
+  pass waits `--curation-interval` (30 s) between requests to leave room for
+  the live site, and waits out a `Retry-After` instead of writing the batch off.
+- **Type-specimen tips are marked from three sources, by exact accession only.**
   `app/services/type_specimen_service.py` merges MycoMap's type list
   (`mycomap_type_specimens.json`, replaced weekly by
   `scripts/dikarya_refresh_type_specimens.py` via
   `ops/cron/dikarya-refresh-type-specimens`) with GenBank's own `/type_material`
   qualifier or RefSeq's "from TYPE material" definition marker
   (`genbank_type_material.jsonl`, appended by `_parse_genbank_xml()` on every
-  GenBank fetch and backfilled by the same script). Both live in
+  GenBank fetch and backfilled by the same script) and MycoMap.org's curation
+  flag (`isType` from `genbank-curation`, `mycomap_curation_types.jsonl`,
+  appended by `curated_genbank_rows()` on every curation lookup and re-asked
+  for the last 8 days' jobs by the script's `curation` pass). The third source
+  exists because a type a curator designates on MycoMap.org (`typeBasis:
+  "manual"`) never reaches the type list -- job cewq held seven of them, none
+  marked. Only a positive flag with a basis in `TRUSTED_CURATION_BASES`
+  (`manual`, `refseq`, `type_material`, `mycomap`) marks: `isType: false` means
+  "not designated on MycoMap" (and a `manual` false is a curator's "Not type"),
+  never "not a type" on its own. `typeBasis: "source"` was a bare match on the
+  word "type" in GenBank's source qualifiers -- "RFLP type 52", "its type b",
+  "type: OTU" -- wrong every time it was checked. MycoMap.org PR #18 rewrites
+  `title` and `source` with type-word rules; trust them only once it is
+  deployed and its recheck script has been applied to .org's
+  `genbank_curation` table. The check runs on read (`curation_marks()`), so
+  changing the list also changes entries already recorded. All live in
   `Config.TYPE_SPECIMEN_DIR` (`cache/type_specimens`, tree:dikarya 2775 like
   `cache/blast`). If the processed snapshot is absent on a fresh deployment,
   the app reads and normalizes the committed raw API dump
@@ -761,6 +815,18 @@ When a new CLI version is published:
   as text by `tree_io.relabel_newick_text()`, touching only the type tips'
   labels -- a Biopython round trip rounds every support value to two decimals,
   and that download promises the builder's own file.
+- **The "closest type specimen" callout compares only type tips already in the
+  tree.** `app/services/closest_type_service.py` (served by
+  `/api/job/<id>/closest-type`, shown in `#notice-closest-type`) computes
+  identity on the job's own *untrimmed* alignment, over positions where both
+  rows hold an unambiguous base. It is not the BLAST `identity` in
+  `sequence_metadata`, and it reads tree state without ever creating or saving
+  it.
+- **phylotree's built-in "Reroot on this node" stays off (`'reroot': false`).**
+  It rerooted only the browser's copy, so every clade on the new root path
+  hashed to a stable ID the server's tree lacks and Rotate failed with "Unknown
+  internal node" (job 342b8d1f). The node menu's own "Reroot on this node"
+  goes through `/tree/reroot`. Any topology change must go through the backend.
 - **GenBank accession policy lives in `fasta_utils.GENBANK_ACCESSION_RE`.** The
   large-scale INSDC families (WGS contigs, TSA transcripts, TLS targeted-locus
   records) share one accession structure and the string does not say which is
@@ -898,6 +964,20 @@ When a new CLI version is published:
   "Single-level undo of a tree edit" section of `ARCHITECTURE.md`.
 - Collapsing a clade in the viewer is display state only (phylotree's transient
   `node.collapsed`). It must never prune, persist, or trigger a recompute.
+- **A rectangular tree's width is fitted to the pane, not derived from its depth.**
+  The viewer sets phylotree's `branch-width` option (added in our `phylotree.js`
+  `do_lr`) to (pane width − measured label/annotation width) × `horizontalPercent`;
+  Layout → Width steps that percentage and Fit resets it to 100. Before 2026-10-20
+  the width was `max_depth × 20px`, which ranged from 60 to 1,700 px across real
+  trees. A saved `widthPercent` replaces the old `spacingX` preference, which is
+  ignored. "Stretch clade to screen width" (node menu) is a transient
+  `horizontalPercent` that is never saved. Radial layout keeps the per-level step.
+- **Long-branch breaks are layout-only.** `_computeLongBranchBreaks()` marks at
+  most 3 outlier branches (≥25% of the drawn depth and ≥6× the 90th-percentile
+  branch), and phylotree's `display-branch-length` hook draws them shortened with
+  a `//` and their true length. Never shorten a branch through
+  `branch_length_accessor` or `data.attribute`: those feed Newick export,
+  rerooting and the branch tooltip, which must keep the true length.
 - Use existing Tailwind utility style patterns from `templates/sequence_entry.html` and `templates/partials/*.html`.
 - Reuse modal structure from `templates/partials/add_sequences_modal.html`.
 - Support dark mode (`dark:*` classes) for all new UI.
@@ -1036,6 +1116,18 @@ internet. Paths are normalised (ids and digit runs collapsed) and stored only
 as a hash. Without Redis the verdict is `emerging` -- no opinion, never
 `singleton`, so the failure mode is quiet rather than accusatory.
 
+The expiry **slides**: each observation pushes it a full week out, so a path is
+forgotten only after a week in which nobody asked for it. It used to be set
+once, at key creation, which wiped every path's history seven days after it was
+first seen however busy it was -- a sweep landing just after that reset scored
+every app-shaped path as a singleton and escalated (35.189.61.0/24, a plain
+`.env` scanner, 2026-11-07). Do not "simplify" the script back to setting the
+TTL only when it is missing.
+
+A scanner word in the job-id slot (`/job/.env`) is filed as scanner, not as
+`job_id_malformed`: it is a sweep appending its dictionary to a directory it
+found on our pages, not a test of the id parser.
+
 **`app/services/security_honeytokens.py` plants paths that exist only in our
 own output.** A scanner's dictionary was fixed before it ever contacted this
 host, so it cannot ask for something it learned here. Three today: a
@@ -1057,7 +1149,10 @@ answers on port 443, and all four WARN immediately:
 - `path_traversal_app_surface` -- traversal that starts from a job artifact
   route rather than the site root. A sweep asks every host for `/etc/passwd`
   (still reported, as plain `path_traversal`); only someone who has looked at
-  Dikarya climbs out of `/job/<id>/download/`.
+  Dikarya climbs out of `/job/<id>/download/`. The traversal has to start
+  *inside* the route (`/static/../`): `/static../` is the stock nginx
+  "off-by-slash" alias probe, sent to the same ten directory names on every
+  host, and is plain `path_traversal`.
 - `artifact_path_probe` -- a request naming the on-disk layout
   (`input_info.json`, `tree_state.json`, `var/jobs/...`). Those names are in
   this repository and in no scanner dictionary anywhere.
@@ -1138,6 +1233,26 @@ Credentials are redacted; request bodies and authorization/cookie headers are
 never archived. Archives are compressed, not truncated or automatically expired.
 They are outside the static/download trees. Do not paste an entire archive into
 a public issue; it can contain observation data and account context.
+
+**Rejected FASTA inputs are retained in full.** Find `event=fasta.rejected
+diagnostic=<id>` in `errors.log`, then read
+`var/logs/fasta-rejections/<UTC-date>/<id>.json.gz` with `gzip -dc`. The archive
+contains the original submitted text, source (paste/upload/API/worker), upload
+filename when available, request/user/job context, and structured validation
+issues with original line, column, record name, sequence position and offending
+Unicode code point. The user explicitly authorized retention of sequence data.
+Only the displayed issue list is capped at 100; the original text is never
+truncated. No credentials or authorization/cookie headers are captured.
+`event=fasta.diagnostic_write_failed` reports archive failures without hiding
+the validation error. Tests isolate these archives in `tests/conftest.py`.
+
+The Tree Builder calls `/api/fasta/check` before adding pasted/uploaded FASTA.
+Its formatting repair is a preview requiring an explicit Apply action. Never
+silently drop empty records, replace unknown bases, or remove punctuation to
+make an invalid sequence pass. Both submission APIs validate before dedup can
+discard a malformed record. Keep these checks on `analyze_dna_fasta()` in
+`fasta_utils.py`, shared with workers; `parse_fasta_records()` remains the
+permissive parser for existing pipeline artifacts.
 
 New upstream calls should use `diagnostic_urlopen` from
 `app/services/api_diagnostics.py`, or `record_requests_failure` for requests/httpx
@@ -1329,6 +1444,23 @@ built from counts and option names for this same reason.
 ## Ops / Debugging Notes
 
 - Production runs under systemd (Gunicorn web + worker services).
+- **nginx's crawler blocklist lives in `ops/nginx/00-bot-blocklist`** (the
+  installed `/etc/nginx/sites-available/00-bot-blocklist` is a root-owned copy;
+  the install command is in the file's header). Blocked crawlers get a 403 for
+  everything except `/robots.txt`, and every bot it blocks must also have a
+  `Disallow: /` group in `app/static/robots.txt`, so a compliant one can read
+  that and stop instead of retrying against the 403.
+- **`/amanitaceae/` is untrusted third-party content on our origin.** It is a
+  static mirror (not in git) of Tulloss's amanitaceae.org, built 2026-05-30 from
+  archived copies of a CMS that was compromised in 2023-24 (the "Boolka"
+  campaign injected a script dropper into its content snippets). nginx serves
+  it with a `Content-Security-Policy: sandbox ...` header (in
+  `ops/nginx/dikarya`), so its legacy jQuery/xajax/CKEditor code runs in an
+  opaque origin and cannot reach dikarya.us cookies, storage or same-origin
+  APIs, and cannot load from or send to other hosts. Keep that header, and do
+  not add third-party scripts to the mirror; the 2026-11-08 cleanup removed its
+  Google Analytics loaders and the inert BeEF clean-up snippets. Backups from
+  that cleanup are in `~/.dikarya/backups/`.
 - If route changes do not appear in production, Gunicorn reload/restart may be required.
 - `127.0.0.1` is not reachable for website tests in this environment; use `https://dikarya.us` for local website testing instead.
 - Check app logs for 500 errors before changing code (see "Reading logs" above).

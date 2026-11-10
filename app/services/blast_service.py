@@ -6,10 +6,16 @@ import re
 import time
 import requests
 import threading
+import os
+import tempfile
+import fcntl
+from pathlib import Path
+from functools import wraps
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
 from app.services.api_diagnostics import record_requests_failure, record_api_failure
+from app.services import ncbi_pacing
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,93 @@ _ISOLATION_BUDGET_SECONDS = 60.0
 _request_deadline: contextvars.ContextVar = contextvars.ContextVar(
     "ncbi_request_deadline", default=None
 )
+_pending_search = contextvars.ContextVar("blast_pending_search", default=None)
+
+
+def _write_pending(context):
+    if context is None:
+        return
+    path, state = context
+    temporary = None
+    try:
+        from app.services.artifact_storage import default_file_mode
+        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".blast-pending-")
+        with os.fdopen(fd, "w") as stream:
+            os.fchmod(stream.fileno(), path.stat().st_mode & 0o777 if path.exists() else default_file_mode())
+            json.dump(state, stream)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning("event=blast.resume_store_failed error=%s", type(exc).__name__)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _forget_pending():
+    context = _pending_search.get()
+    if context:
+        try:
+            context[0].unlink(missing_ok=True)
+        except OSError:
+            logger.warning("event=blast.resume_cleanup_failed")
+
+
+def _serialized_search(function):
+    @wraps(function)
+    def run(query, config, *args, **kwargs):
+        directory = getattr(config, "BLAST_CACHE_DIR", None)
+        if not isinstance(directory, (str, Path)):
+            return function(query, config, *args, **kwargs)
+        identity = args[0] if args else kwargs.get("min_identity", 90.0)
+        limit = args[1] if len(args) > 1 else kwargs.get("max_sequences", 50)
+        text = ",".join(sorted(query)) if isinstance(query, list) else query
+        key = _hash_query(text, identity, limit)
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{key}.pending.json"
+        from app.services.artifact_storage import default_file_mode
+        lock_path = directory / f"{key}.lock"
+        existed = lock_path.exists()
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, default_file_mode())
+        with os.fdopen(fd, "r+") as lock:
+            if not existed:
+                os.fchmod(lock.fileno(), default_file_mode())
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise TimeoutError("This BLAST search is already being checked. Please try again shortly.") from exc
+            state = {}
+            try:
+                saved = json.loads(path.read_text())
+                if (isinstance(saved, dict) and re.fullmatch(r"[A-Z0-9]{3,64}", str(saved.get("rid", "")))
+                        and 0 <= time.time() - float(saved["created_at"]) < 4 * 3600):
+                    state = saved
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+            token = _pending_search.set((path, state))
+            try:
+                return function(query, config, *args, **kwargs)
+            finally:
+                _pending_search.reset(token)
+    return run
+
+
+def _submit_or_resume(submit):
+    context = _pending_search.get()
+    state = context[1] if context else {}
+    if state.get("rid"):
+        rid = state["rid"]
+        wait = max(0, float(state.get("next_poll_at", 0)) - time.time())
+        logger.info("event=blast.resumed rid=%s", rid)
+    else:
+        rid, wait = submit()
+        state.update(rid=rid, created_at=time.time(), next_poll_at=time.time() + wait)
+        _write_pending(context)
+    from flask import g, has_request_context
+    if has_request_context():
+        g.blast_rid = rid
+        g.blast_can_resume = bool(context and context[0].exists())
+    return rid, wait
 
 
 class BudgetExhausted(TimeoutError):
@@ -41,6 +134,10 @@ class BudgetExhausted(TimeoutError):
     re-raise it: swallowed, a 429 near the deadline returned a partial FASTA
     while budget technically remained, and that partial set was cached.
     """
+
+
+class BlastSearchUnavailable(ValueError):
+    """The saved upstream search can no longer be resumed."""
 
 
 def _remaining_budget() -> Optional[float]:
@@ -57,9 +154,11 @@ def _remaining_budget() -> Optional[float]:
     return remaining
 
 
-def _sleep_before_retry(seconds: float) -> None:
+def _sleep_before_retry(seconds: float, deadline=None) -> None:
     """Back off, but refuse a wait the request budget cannot absorb."""
     remaining = _remaining_budget()
+    if deadline is not None:
+        remaining = min(remaining, deadline - time.monotonic()) if remaining is not None else deadline - time.monotonic()
     if remaining is not None and seconds >= remaining:
         raise BudgetExhausted(
             f"BLAST request budget exhausted (retry wait {seconds:.0f}s, "
@@ -90,7 +189,15 @@ def _normalize_max_sequences(value) -> int:
         return DEFAULT_MAX_SEQUENCES
     return limit if limit > 0 else DEFAULT_MAX_SEQUENCES
 
-def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requests.Response:
+def _in_web_request() -> bool:
+    try:
+        from flask import has_request_context
+        return has_request_context()
+    except Exception:
+        return False
+
+
+def _ncbi_request(method: str, url: str, max_retries: int = 5, deadline=None, **kwargs) -> requests.Response:
     """
     Helper to perform NCBI requests with:
     - Global rate limiting (min gap between requests)
@@ -103,15 +210,6 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
     """
     global _last_request_time
     
-    # 1. Apply Rate Limit
-    with _ncbi_lock:
-        now = time.monotonic()
-        elapsed = now - _last_request_time
-        if elapsed < _MIN_REQUEST_GAP:
-            sleep_time = _MIN_REQUEST_GAP - elapsed
-            time.sleep(sleep_time)
-        _last_request_time = time.monotonic()
-
     # 2. Prepare headers
     headers = kwargs.get("headers", {})
     # Use a descriptive User-Agent
@@ -126,11 +224,34 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
     backoff = 1.0  # Start with 1s
     
     for attempt in range(max_retries):
+        if not ncbi_pacing.is_eutils(url):
+            with _ncbi_lock:
+                wait = max(0, _MIN_REQUEST_GAP - (time.monotonic() - _last_request_time))
+                if wait:
+                    _sleep_before_retry(wait, deadline)
+                _last_request_time = time.monotonic()
         # On the last pass there is no retry left to back off before: sleeping
         # here only delayed the RetryError below by the full backoff (4s on the
         # default three attempts) while holding the caller's request slot.
         last_attempt = attempt == max_retries - 1
+        try:
+            effective = _request_deadline.get()
+            effective = min(effective, deadline) if effective is not None and deadline is not None else (effective or deadline)
+            if effective is None and not _in_web_request():
+                # A worker call has no budget. Before pacing was shared it slept
+                # through its own Retry-After; give it room to wait out the
+                # longest shared cooldown rather than wait_for_slot's 60 s
+                # default, which failed the BLAST step on a longer one. A web
+                # request without a budget keeps that default.
+                effective = time.monotonic() + ncbi_pacing.MAX_COOLDOWN_SECONDS + 60
+            ncbi_pacing.wait_for_slot(url, deadline=effective)
+        except TimeoutError as exc:
+            raise BudgetExhausted(str(exc)) from exc
         remaining = _remaining_budget()
+        if deadline is not None:
+            remaining = min(remaining, deadline - time.monotonic()) if remaining is not None else deadline - time.monotonic()
+            if remaining <= 0:
+                raise BudgetExhausted("NCBI request budget exhausted")
         if remaining is not None:
             kwargs["timeout"] = _clamp_timeout(kwargs.get("timeout"), remaining)
         try:
@@ -140,35 +261,36 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
             
             # Check for 429 Too Many Requests
             if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        wait_time = int(retry_after)
-                    except ValueError:
-                        wait_time = backoff
-                else:
-                    wait_time = backoff
+                ncbi_pacing.note_cooldown(url, response.headers.get("Retry-After"))
+                wait_time = ncbi_pacing.retry_after_seconds(response.headers.get("Retry-After"), backoff)
                 
                 if last_attempt:
+                    response.close()
                     logger.warning(f"NCBI 429 (Too Many Requests) on final attempt {attempt + 1}/{max_retries}. Giving up.")
                     break
                 logger.warning(f"NCBI 429 (Too Many Requests). Waiting {wait_time}s before retry {attempt + 2}/{max_retries}")
-                _sleep_before_retry(wait_time)
+                response.close()
+                if deadline is not None and time.monotonic() + wait_time >= deadline:
+                    raise BudgetExhausted("NCBI request budget cannot absorb Retry-After")
+                _sleep_before_retry(wait_time, deadline)
                 backoff *= 2 # Exponential backoff for next time if needed
                 continue
                 
             # Check for 5xx Server Errors
             if 500 <= response.status_code < 600:
+                response.close()
                 if last_attempt:
                     logger.warning(f"NCBI {response.status_code} Error on final attempt {attempt + 1}/{max_retries}. Giving up.")
                     break
                 logger.warning(f"NCBI {response.status_code} Error. Waiting {backoff}s before retry {attempt + 2}/{max_retries}")
-                _sleep_before_retry(backoff)
+                _sleep_before_retry(backoff, deadline)
                 backoff *= 2
                 continue
             
             # For other statuses, letting raise_for_status handle or return response
             # Note: We return response here and let caller decide to raise for 4xx
+            if attempt:
+                logger.info("event=ncbi.recovered retries=%s status=%s", attempt, response.status_code)
             return response
             
         except (requests.ConnectionError, requests.Timeout) as e:
@@ -177,7 +299,7 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
                 logger.warning(f"NCBI Connection/Timeout error on final attempt {attempt + 1}/{max_retries}: {e}. Giving up.")
                 break
             logger.warning(f"NCBI Connection/Timeout error: {e}. Waiting {backoff}s before retry {attempt + 2}/{max_retries}")
-            _sleep_before_retry(backoff)
+            _sleep_before_retry(backoff, deadline)
             backoff *= 2
             
     # Every attempt is spent.
@@ -202,6 +324,7 @@ def _poll_budget() -> float:
     return BLAST_MAX_WAIT_SECONDS if remaining is None else remaining
 
 
+@_serialized_search
 def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
                         max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger,
                         max_wait: Optional[float] = None) -> Dict:
@@ -219,7 +342,7 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
     
     budget_token = _start_request_budget(max_wait)
     try:
-        rid, rtoe = _submit_blast_request(seq, config, min_identity, max_sequences)
+        rid, rtoe = _submit_or_resume(lambda: _submit_blast_request(seq, config, min_identity, max_sequences))
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
         _poll_blast(rid, rtoe, config, logger, max_wait=_poll_budget())
@@ -237,6 +360,14 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
         
         return _save_cache(query_hash, hit_accessions, hit_details, fasta_content, config)
         
+    except TimeoutError as e:
+        if max_wait is None:
+            # No request budget means no resumable wait (the worker): the
+            # BLAST step has failed and must say so where failures are read.
+            logger.error(f"BLAST failed: {e}")
+        else:
+            logger.info("event=blast.waiting %s", e)
+        raise
     except Exception as e:
         logger.error(f"BLAST failed: {e}")
         # Re-raise to let caller handle failure (e.g. show user error)
@@ -244,6 +375,7 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
     finally:
         _end_request_budget(budget_token)
 
+@_serialized_search
 def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0,
                           max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger,
                           max_wait: Optional[float] = None) -> Dict:
@@ -267,11 +399,11 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
     budget_token = _start_request_budget(max_wait)
     try:
         # 1. Fetch initial sequences to use as query
-        query_fasta = fetch_fasta_for_accessions(sorted_accessions)
-        _remaining_budget()
-        
-        # 2. Run BLAST with these sequences
-        rid, rtoe = _submit_blast_request(query_fasta, config, min_identity, max_sequences)
+        def submit():
+            query_fasta = fetch_fasta_for_accessions(sorted_accessions)
+            _remaining_budget()
+            return _submit_blast_request(query_fasta, config, min_identity, max_sequences)
+        rid, rtoe = _submit_or_resume(submit)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
         _poll_blast(rid, rtoe, config, logger, max_wait=_poll_budget())
@@ -296,6 +428,12 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
         
         return _save_cache(query_hash, all_accessions, hit_details, fasta_content, config)
 
+    except TimeoutError as e:
+        if max_wait is None:
+            logger.error(f"BLAST from accessions failed: {e}")
+        else:
+            logger.info("event=blast.waiting %s", e)
+        raise
     except Exception as e:
         logger.error(f"BLAST from accessions failed: {e}")
         raise
@@ -351,6 +489,7 @@ def _save_cache(query_hash: str, hit_accessions: List[str], hit_details: List[Di
         
     with open(fasta_path, 'w') as f:
         f.write(fasta_content)
+    _forget_pending()
         
     return {
         "cached": False,
@@ -482,6 +621,10 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger,
         
         # Use helper
         try:
+            context = _pending_search.get()
+            if context:
+                context[1]["next_poll_at"] = time.time() + poll_interval
+                _write_pending(context)
             response = _ncbi_request("GET", NCBI_BLAST_URL, params=params, timeout=(5, 30))
             # Don't strictly raise on 404/etc inside poll loop? Actually SearchInfo should exist.
             # If 404, maybe RID expired.
@@ -501,11 +644,13 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger,
             
             if "Status=FAILED" in content:
                 record_requests_failure(response, reason="blast_search_failed")
-                raise RuntimeError(f"BLAST failed for RID {rid}")
+                _forget_pending()
+                raise BlastSearchUnavailable("NCBI could not complete this search. Try again to start a new search.")
                 
             if "Status=UNKNOWN" in content:
                 record_requests_failure(response, reason="blast_search_unknown")
-                raise RuntimeError(f"BLAST RID {rid} expired or unknown")
+                _forget_pending()
+                raise BlastSearchUnavailable("The saved NCBI search has expired. Try again to start a new search.")
                 
             if "Status=READY" in content:
                 if "ThereAreHits=yes" in content:
@@ -515,7 +660,7 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger,
                     logger.warning("BLAST Status: READY but ThereAreHits=no (will still attempt to fetch results).")
                 return
                 
-        except BudgetExhausted:
+        except (BudgetExhausted, BlastSearchUnavailable):
             raise
         except Exception as e:
              logger.warning(f"Poll exception: {e}. Retrying next cycle.")
@@ -967,17 +1112,23 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
 
     return result
 
-def _build_header(record: Dict) -> str:
+def _build_header(record: Dict, display_organism: Optional[str] = None) -> str:
     """
     Construct FASTA header from parsed record.
     Format: >{acc_ver} {organism} {sample_id} {extras} {type_status}
+
+    ``display_organism`` (MycoMap.org's curated name) replaces GenBank's
+    organism in the label. GenBank's own name still drives the clean-up below,
+    because that is the name GenBank repeats inside its voucher, isolate and
+    location qualifiers.
     """
     # 1. Base
     # Use version if available, else accession
     acc_ver = record.get("version") or record.get("accession")
     organism = record.get("organism") or "(unknown organism)"
-    
-    parts = [acc_ver, organism]
+    shown_organism = " ".join(str(display_organism or "").split()) or organism
+
+    parts = [acc_ver, shown_organism]
     
     # Helper to clean redundant organism name from values
     def _strip_organism(val: str, org_name: str) -> str:
@@ -1133,6 +1284,33 @@ def _build_header(record: Dict) -> str:
         
     return ">" + " ".join(parts)
 
+# Upper bound on the MycoMap.org curation lookup inside one GenBank fetch. It
+# answers 100 accessions in well under a second; this only caps an outage.
+MYCOMAP_CURATION_BUDGET_SECONDS = 10.0
+
+
+def _mycomap_curated_names(accessions: List[str]) -> Dict[str, str]:
+    """MycoMap.org's curated name per bare accession; {} when unavailable.
+
+    Best effort, inside the current request budget: GenBank's names stand
+    whenever MycoMap.org cannot answer in time. tests/conftest.py stubs this
+    out so the suite never reaches mycomap.org.
+    """
+    if not accessions:
+        return {}
+    try:
+        budget = MYCOMAP_CURATION_BUDGET_SECONDS
+        remaining = _remaining_budget()
+        if remaining is not None:
+            budget = min(budget, remaining)
+        from app.services.mycomap_org_service import _curated_genbank_names
+        return _curated_genbank_names(accessions, deadline=time.monotonic() + budget)
+    except Exception as exc:  # a label lookup must never fail the fetch
+        logger.warning("event=genbank.mycomap_curation_skipped count=%s error=%s",
+                       len(accessions), exc)
+        return {}
+
+
 def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     """
     Fetch FASTA sequences from NCBI for the given accessions using GenBank XML
@@ -1195,15 +1373,24 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     # 2. Reassemble deterministically
     final_lines = []
     missing_for_fallback = []
-    
+    # MycoMap's names always override GenBank's: MycoMap.org is curated on top
+    # of GenBank, so a misidentified record (OP739129, filed as Podaxis
+    # pistillaris, is the P. inyoensis holotype) is corrected there and only
+    # there. Every GenBank label this app builds comes through here.
+    curated_names = _mycomap_curated_names([
+        acc for acc in validated
+        if (records_by_ver.get(acc) or records_by_acc.get(acc) or {}).get("sequence")
+    ])
+
     for acc in validated:
         # Try finding record
         record = records_by_ver.get(acc) or records_by_acc.get(acc)
-        
+
         if record and record.get("sequence"):
             counters["xml_ok"] += 1
-            
-            header = _build_header(record)
+
+            header = _build_header(
+                record, display_organism=curated_names.get(acc.upper().split(".")[0]))
             seq = record["sequence"]
             
             # Wrap sequence at 60 chars
@@ -1283,4 +1470,9 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
                     unresolved, len(chunk) - len(unresolved)
                 )
 
-    return "\n".join(final_lines)
+    combined = "\n".join(final_lines)
+    returned = _fasta_accession_tokens(combined)
+    fetched = sum(_accession_is_present(acc, returned) for acc in validated)
+    logger.info("event=import.source_summary operation=genbank_fasta source=ncbi expected=%s fetched=%s omitted=%s recovered=%s",
+                len(validated), fetched, len(validated) - fetched, max(0, fetched - counters["xml_ok"]))
+    return combined

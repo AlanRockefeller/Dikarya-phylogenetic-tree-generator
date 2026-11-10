@@ -96,5 +96,57 @@ class RefreshLogRoundTrip(unittest.TestCase):
         self.assertIn("never run here", out.getvalue())
 
 
+class CurationCursor(unittest.TestCase):
+    """A capped or interrupted curation run is continued by the next one."""
+
+    ACCESSIONS = {f"MK000000{n}" for n in range(1, 8)}
+
+    def _run(self, cap, fail_on=None):
+        from types import SimpleNamespace
+        from unittest import mock
+        from app.services import mycomap_org_service
+
+        asked = []
+
+        def rows(batch, strict=False):
+            if fail_on and fail_on in batch:
+                raise RuntimeError("unavailable")
+            asked.extend(batch)
+            return {}
+
+        args = SimpleNamespace(since_days=0, max_curation_accessions=cap, dry_run=False,
+                               curation_max_minutes=150, curation_interval=0)
+        with mock.patch.object(refresh, "job_accessions", lambda days: (set(self.ACCESSIONS), 1)), \
+                mock.patch.object(mycomap_org_service, "CURATION_BATCH_SIZE", 2), \
+                mock.patch.object(mycomap_org_service, "curated_genbank_rows", rows), \
+                mock.patch.object(refresh.time, "sleep", lambda seconds: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            refresh.run_curation(args)
+        return asked, refresh._read_curation_cursor("since_days=0")
+
+    def test_capped_runs_advance_and_wrap_then_a_full_run_clears(self):
+        from unittest import mock
+        from app.services import type_specimen_service as tss
+        with TemporaryDirectory() as d, mock.patch.object(tss, "DATA_DIR", Path(d)):
+            self.assertEqual(self._run(3), (["MK0000001", "MK0000002", "MK0000003"], "MK0000003"))
+            self.assertEqual(self._run(3), (["MK0000004", "MK0000005", "MK0000006"], "MK0000006"))
+            self.assertEqual(self._run(3), (["MK0000007", "MK0000001", "MK0000002"], "MK0000002"))
+            asked, cursor = self._run(0)
+            self.assertEqual(sorted(asked), sorted(self.ACCESSIONS))
+            self.assertEqual(asked[0], "MK0000003")
+            self.assertEqual(cursor, "")
+
+    def test_an_unanswered_batch_is_where_the_next_run_starts(self):
+        from unittest import mock
+        from app.services import type_specimen_service as tss
+        with TemporaryDirectory() as d, mock.patch.object(tss, "DATA_DIR", Path(d)):
+            asked, cursor = self._run(0, fail_on="MK0000003")
+            self.assertNotIn("MK0000003", asked)
+            self.assertEqual(cursor, "MK0000002")
+            asked, cursor = self._run(0)
+            self.assertEqual(asked[0], "MK0000003")
+            self.assertEqual(cursor, "")
+
+
 if __name__ == "__main__":
     unittest.main()

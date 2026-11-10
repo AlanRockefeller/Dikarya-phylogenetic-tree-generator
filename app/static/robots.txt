@@ -14,6 +14,12 @@
 # slash covers both the bare route and everything beneath it. Do not "tidy" the
 # slashes back on. /tree/oauth/ keeps its slash on purpose: /tree itself is a
 # public page that must stay crawlable.
+#
+# Alan 11/1/26 - "/tree?" is the query-string form only, so bare /tree is still
+# crawlable. Every /tree?... URL is per-job (the viewer's Clone and Add-sequences
+# links, /tree?clone_job_id=<id> and /tree?edit_job_id=<id>), and rendering one
+# runs the Tree Builder, which downloads that job's sequences. A rendering
+# crawler pulled the sequences of ~800 jobs that way from 2026-10-28 to 10-31.
 
 User-agent: *
 Disallow: /api/
@@ -22,6 +28,7 @@ Disallow: /job
 Disallow: /auth/
 Disallow: /labels/
 Disallow: /tree/oauth/
+Disallow: /tree?
 Disallow: /voucher-labels/export
 Disallow: /whats-new/edit
 Disallow: /whats-new/add
@@ -61,6 +68,7 @@ Disallow: /job
 Disallow: /auth/
 Disallow: /labels/
 Disallow: /tree/oauth/
+Disallow: /tree?
 Disallow: /voucher-labels/export
 Disallow: /whats-new/edit
 Disallow: /whats-new/add
@@ -74,6 +82,11 @@ Allow: /
 # this site and never has: in a two-day sample ImageBot alone made 43,466
 # requests, all 404, ~88% of all traffic. nginx blocks these outright; the
 # entries are kept here so a well-behaved client can opt out before being blocked.
+#
+# Alan 11/8/26 - Everything nginx blocks (ops/nginx/00-bot-blocklist) must have a
+# "Disallow: /" group here, and the blocklist now lets those bots read this one
+# file: until then they got a 403 for robots.txt too, never saw these groups, and
+# kept retrying.
 User-agent: ImageBot
 Disallow: /
 
@@ -97,6 +110,15 @@ User-agent: PetalBot
 Disallow: /
 
 User-agent: DataForSeoBot
+Disallow: /
+
+User-agent: BLEXBot
+Disallow: /
+
+User-agent: ZoominfoBot
+Disallow: /
+
+User-agent: serpstatbot
 Disallow: /
 
 User-agent: Bytespider

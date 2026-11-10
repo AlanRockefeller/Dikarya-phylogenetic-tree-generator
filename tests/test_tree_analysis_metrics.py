@@ -1474,19 +1474,29 @@ def test_validation_failures_are_upstream_errors():
     assert issubclass(service.TreeAnalysisUpstreamError, service.TreeAnalysisError)
 
 
-def test_headline_longer_than_the_schema_allows_is_rejected():
+def test_long_headline_preserves_the_complete_verdict_and_review():
     review = _valid_review()
-    review["headline"] = "x" * (service.HEADLINE_MAX_CHARACTERS + 1)
+    headline = (
+        "The main clade is broadly consistent across the well-covered sequences, "
+        "but the divergent tips and weakly supported backbone require inspection "
+        "before interpreting species boundaries."
+    )
+    assert len(headline) > 140
+    review["headline"] = headline
 
-    with pytest.raises(service.TreeAnalysisError, match="headline"):
-        service._validate_review(review)
+    validated = service._validate_review(review)
+
+    assert validated["headline"] == headline
+    assert validated["summary"] == "Paragraph one.\n\nParagraph two."
+    assert validated["concerns"] == _valid_review()["concerns"]
 
 
-def test_headline_at_the_limit_is_accepted():
+@pytest.mark.parametrize("length", [140, 150])
+def test_headline_length_is_not_an_upstream_failure(length):
     review = _valid_review()
-    review["headline"] = "x" * service.HEADLINE_MAX_CHARACTERS
+    review["headline"] = "x" * length
 
-    assert service._validate_review(review)["headline"]
+    assert service._validate_review(review)["headline"] == review["headline"]
 
 
 def test_named_sequence_not_a_tip_is_dropped_from_the_review():

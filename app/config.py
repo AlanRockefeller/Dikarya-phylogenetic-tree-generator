@@ -132,6 +132,28 @@ def count_env(name, default):
     return int(timeout_env(name, default))
 
 
+def nonnegative_int_env(name, default):
+    """Read a whole number >= 0, or ``default`` (with a warning) if unusable.
+
+    For settings where 0 is meaningful, which count_env refuses. Like the other
+    helpers it never raises: this runs at import time, and a typo in a health
+    check knob must not stop web, workers and metrics from starting.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = -1
+    if value < 0:
+        logging.getLogger(__name__).warning(
+            "%s=%r ignored (not a whole number >= 0); using %s", name, raw, default
+        )
+        return default
+    return value
+
+
 # Ceiling on CLAUDE_REVIEW_MAX_BUDGET_USD, which is the only setting that spends
 # money and which travels through sudo into a root-owned wrapper as a plain
 # string. Without a ceiling the per-invocation cap could simply be configured
@@ -506,6 +528,14 @@ class Config:
     # Site-wide billed-review allowance per UTC day. Cache hits do not consume it.
     CLAUDE_REVIEW_MAX_DAILY = int(os.environ.get('CLAUDE_REVIEW_MAX_DAILY', '25'))
     WORKER_DIR = Path(os.environ.get('WORKER_DIR') or BASE_DIR / 'var' / 'workers')
+    WORKER_EXPECTED_COUNTS = {
+        "phylo_high": nonnegative_int_env("EXPECTED_PHYLO_HIGH_WORKERS", 2),
+        "phylo_bulk": nonnegative_int_env("EXPECTED_PHYLO_BULK_WORKERS", 1),
+        "voucher_sync": nonnegative_int_env("EXPECTED_VOUCHER_SYNC_WORKERS", 1),
+    }
+    WORKER_HEALTH_STARTUP_GRACE_SECONDS = nonnegative_int_env(
+        "WORKER_HEALTH_STARTUP_GRACE_SECONDS", 120
+    )
     METRICS_FILE = Path(os.environ.get('METRICS_FILE') or BASE_DIR / 'var' / 'metrics' / 'system_metrics.jsonl')
     DOSAGE_CSV_DIR = Path(os.environ.get('DOSAGE_CSV_DIR') or BASE_DIR / 'dosage-calculator')
     DOSAGE_DB_PATH = Path(os.environ.get('DOSAGE_DB_PATH') or BASE_DIR / 'instance' / 'dosage_calculator.sqlite')

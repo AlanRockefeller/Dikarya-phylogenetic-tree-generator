@@ -43,6 +43,53 @@ class TestJobIdValidation(unittest.TestCase):
         self.assertFalse(security_utils.validate_job_id("aq.c"))
         self.assertFalse(security_utils.validate_job_id("aq/c"))
 
+    def test_multiplication_sign_is_repaired_only_to_a_valid_id(self):
+        self.assertEqual(
+            security_utils.repair_job_id_multiplication_sign("2×7u"),
+            "2x7u",
+        )
+        self.assertEqual(
+            security_utils.repair_job_id_multiplication_sign("2Ã\x977u"),
+            "2x7u",
+        )
+        self.assertIsNone(
+            security_utils.repair_job_id_multiplication_sign("2×7")
+        )
+        self.assertIsNone(
+            security_utils.repair_job_id_multiplication_sign("../../2×7u")
+        )
+        self.assertIsNone(
+            security_utils.repair_job_id_multiplication_sign("2x7u")
+        )
+
+
+class TestJobIdCanonicalRedirect(unittest.TestCase):
+    def setUp(self):
+        from flask import Flask
+        from app import _redirect_mistyped_job_id
+
+        app = Flask(__name__)
+        app.before_request(_redirect_mistyped_job_id)
+
+        @app.route("/job/<job_id>/view", methods=["GET", "POST"])
+        def view_job(job_id):
+            return job_id
+
+        self.client = app.test_client()
+
+    def test_get_redirects_to_canonical_id_and_preserves_query(self):
+        response = self.client.get("/job/2%C3%977u/view?shared=1")
+
+        self.assertEqual(response.status_code, 308)
+        self.assertEqual(response.headers["Location"], "/job/2x7u/view?shared=1")
+
+    def test_invalid_repair_and_mutating_request_are_not_redirected(self):
+        invalid = self.client.get("/job/2%C3%977/view")
+        post = self.client.post("/job/2%C3%977u/view")
+
+        self.assertEqual(invalid.status_code, 200)
+        self.assertEqual(post.status_code, 200)
+
 
 class TestBlastRequestSafety(unittest.TestCase):
     """Test the current BLAST request boundary rather than a removed helper."""

@@ -95,3 +95,23 @@ def test_rate_limit_near_deadline_in_fasta_fetch_is_not_cached():
         with pytest.raises(TimeoutError):
             bs.blast_from_sequence("ACGT", MagicMock(), max_wait=240)
     save.assert_not_called()
+
+
+def test_unbudgeted_worker_call_can_wait_out_a_long_shared_cooldown():
+    # No request budget and no request context: the worker. wait_for_slot's
+    # 60 s default used to fail the BLAST step on a longer shared cooldown.
+    with patch.object(bs.ncbi_pacing, "wait_for_slot") as wait, \
+         patch.object(bs.requests, "request", return_value=_response(200)):
+        bs._ncbi_request("POST", bs.NCBI_EFETCH_URL, timeout=(15, 90))
+    slot_deadline = wait.call_args.kwargs["deadline"]
+    assert slot_deadline - bs.time.monotonic() > bs.ncbi_pacing.MAX_COOLDOWN_SECONDS
+
+
+def test_unbudgeted_web_request_keeps_the_default_slot_wait():
+    from flask import Flask
+
+    with Flask(__name__).test_request_context("/"), \
+         patch.object(bs.ncbi_pacing, "wait_for_slot") as wait, \
+         patch.object(bs.requests, "request", return_value=_response(200)):
+        bs._ncbi_request("POST", bs.NCBI_EFETCH_URL, timeout=(15, 90))
+    assert wait.call_args.kwargs["deadline"] is None

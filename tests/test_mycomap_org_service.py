@@ -215,7 +215,9 @@ def test_local_metadata_preserves_observation_reference():
          patch.object(org, "_read", return_value=XML), \
          patch.object(org, "_local_metadata", return_value=metadata):
         result = org.fetch_results("123", include_ncbi=False)
-    assert "iNat314834254" in result["sequences"][0]["name"]
+    assert result["sequences"][0]["name"].startswith(
+        "MycoMap#551798 iNat314834254"
+    )
     assert result["sequences"][0]["mycomap_sequence_id"] == "551798"
     assert len(result["sequences"][0]["sequence"]) == 100
 

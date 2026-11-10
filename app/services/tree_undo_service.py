@@ -39,8 +39,8 @@ WHAT UNDO RESTORES
 The whole of the three files, so the restored state is internally consistent by
 construction. That also means metadata written by a NON-undoable endpoint after
 the undoable edit would be rolled back with it. Endpoints where that would
-destroy deliberate user work (annotations, MycoMap label refreshes, the focal
-sequence) therefore call ``clear_undo_checkpoint()`` instead of leaving a
+destroy deliberate user work (MycoMap label refreshes, the focal sequence)
+therefore call ``clear_undo_checkpoint()`` instead of leaving a
 checkpoint that would silently revert them. ``/tree/selection_sets`` is the one
 exception and is left alone on purpose: the viewer saves selections
 automatically as part of the normal edit flow (``runBackendAction`` clears the
@@ -50,12 +50,28 @@ kind of state undo should carry back with the edit.
 
 Recompute is never undoable. It also invalidates any checkpoint taken against
 the previous topology, so it clears one.
+
+ANNOTATIONS
+-----------
+Annotation saves are undoable too: they live in ``tree_state.json``, which is
+already in the snapshot. Two of their properties need care:
+
+* The viewer debounces colour, opacity and layer-name edits, so one drag of a
+  colour picker can arrive as several saves. A save carrying the same
+  ``coalesce_key`` as the current checkpoint within
+  ``COALESCE_WINDOW_SECONDS`` of it extends that checkpoint
+  (``extend_undo_checkpoint()``) instead of replacing it, so Undo takes back
+  the whole burst rather than its last half-second. Discrete actions (add,
+  delete, membership, layer order) never pass a key and always get their own.
+* The label is chosen by the server from ``ANNOTATION_UNDO_LABELS``; the client
+  only names a kind. Annotation names are user text and never reach a label.
 """
 
 import json
 import logging
 import math
 import os
+import secrets
 import shutil
 import tempfile
 import time
@@ -87,6 +103,29 @@ SNAPSHOT_PATHS = (
 # user stopped thinking about a week ago.
 MAX_CHECKPOINT_AGE_SECONDS = 7 * 24 * 3600
 
+# How long after the last save in a burst a following save with the same
+# coalesce_key still counts as part of it. Measured from the newest save, not
+# the first, so a long continuous colour drag stays one undo step.
+COALESCE_WINDOW_SECONDS = 10
+
+# What the viewer may say an annotation save was. The client sends only a key;
+# anything unrecognised falls back to the generic label.
+ANNOTATION_UNDO_LABELS = {
+    "add": "new annotation",
+    "edit": "annotation edit",
+    "delete": "annotation deletion",
+    "members": "annotation membership change",
+    "layer_add": "new annotation layer",
+    "layer_delete": "annotation layer deletion",
+    "layer_order": "annotation layer reorder",
+    "layer_visibility": "annotation layer visibility change",
+    "layer_style": "annotation layer style change",
+    "layer_rename": "annotation layer rename",
+}
+ANNOTATION_UNDO_DEFAULT_LABEL = "annotation change"
+# Kinds the viewer saves on a debounce; only these may coalesce.
+ANNOTATION_COALESCING_KINDS = frozenset({"layer_style", "layer_rename"})
+
 # A capture killed between mkdtemp() and the rename leaves its staging directory
 # behind, and the weekly reclaim script's globs do not match it. Anything this
 # old cannot belong to a request still in flight, so reads sweep it up.
@@ -95,6 +134,27 @@ STALE_PENDING_AGE_SECONDS = 3600
 
 def _undo_dir(job_dir: Path) -> Path:
     return Path(job_dir) / UNDO_DIR_NAME
+
+
+def _make_staging_dir(job_dir: Path, prefix: str) -> Path:
+    """``tempfile.mkdtemp()``, but with the mode the rest of a job gets.
+
+    mkdtemp() creates 0700 by design, and the capture's staging directory is
+    renamed into place as the live checkpoint, so every ``.tree_undo`` came out
+    owner-only in a job directory the ``dikarya`` group otherwise maintains
+    (AGENTS.md: "Writing to var/jobs"). ``mkdir(0o777)`` applies the process
+    umask instead -- 0775 under the services' ``UMask=0002``, 0755 under the
+    usual 0022 -- and the kernel carries the job directory's setgid down, with
+    no chmod for the workers' ``RestrictSUIDSGID`` to refuse.
+    """
+    for _ in range(100):
+        candidate = Path(job_dir) / f"{prefix}{secrets.token_hex(4)}"
+        try:
+            candidate.mkdir(mode=0o777)
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"no unused staging name under {job_dir}")
 
 
 def _flat_name(relative: str) -> str:
@@ -200,16 +260,21 @@ class _PendingCheckpoint:
         self.staging = staging
         self.operation = operation
         self.label = label
+        self.coalesce_key: Optional[str] = None
         self.committed = False
 
-    def commit(self, label: Optional[str] = None) -> None:
+    def commit(self, label: Optional[str] = None,
+               coalesce_key: Optional[str] = None) -> None:
         """Mark the snapshot as the job's active undo point.
 
         ``label`` may be refined here, because the honest description of an
         edit ("prune of 18 sequences") is often only known once it has run.
+        ``coalesce_key`` lets a later save of the same kind extend this
+        checkpoint instead of replacing it (see ``extend_undo_checkpoint()``).
         """
         if label is not None:
             self.label = label
+        self.coalesce_key = coalesce_key
         self.committed = True
 
     def cancel(self) -> None:
@@ -234,7 +299,7 @@ def undo_checkpoint(job_dir: Path, operation: str, label: str):
     staging: Optional[Path] = None
     handle: Optional[_PendingCheckpoint] = None
     try:
-        staging = Path(tempfile.mkdtemp(dir=str(job_dir), prefix=PENDING_PREFIX))
+        staging = _make_staging_dir(job_dir, PENDING_PREFIX)
         present: List[str] = []
         absent: List[str] = []
         for relative in SNAPSHOT_PATHS:
@@ -275,6 +340,9 @@ def undo_checkpoint(job_dir: Path, operation: str, label: str):
         return
 
     manifest["label"] = handle.label
+    if handle.coalesce_key:
+        manifest["coalesce_key"] = handle.coalesce_key
+        manifest["updated_at"] = manifest["created_at"]
     active = _undo_dir(job_dir)
     backup: Optional[Path] = None
     try:
@@ -298,6 +366,66 @@ def undo_checkpoint(job_dir: Path, operation: str, label: str):
     else:
         if backup is not None:
             shutil.rmtree(backup, ignore_errors=True)
+
+
+def extend_undo_checkpoint(job_dir: Path, operation: str, coalesce_key: str,
+                           label: Optional[str] = None) -> bool:
+    """Fold this save into the current checkpoint if it continues the same burst.
+
+    Returns True when the existing checkpoint was for the same ``operation`` and
+    ``coalesce_key`` and was last extended within ``COALESCE_WINDOW_SECONDS``;
+    its snapshot (the state from before the burst began) is then kept and only
+    its timestamp and label move forward. Returns False, changing nothing, in
+    every other case, and the caller takes a fresh checkpoint as usual.
+
+    Must be called with ``tree_state_lock`` held.
+    """
+    if not coalesce_key:
+        return False
+    job_dir = Path(job_dir)
+    manifest = _read_manifest(job_dir)
+    if manifest is None or _checkpoint_is_expired(manifest):
+        return False
+    if manifest.get("operation") != operation or manifest.get("coalesce_key") != coalesce_key:
+        return False
+    last = manifest.get("updated_at", manifest.get("created_at"))
+    if (
+        isinstance(last, bool)
+        or not isinstance(last, (int, float))
+        or not math.isfinite(last)
+    ):
+        return False
+    now = time.time()
+    if not 0 <= now - last <= COALESCE_WINDOW_SECONDS:
+        return False
+
+    manifest["updated_at"] = now
+    if label is not None:
+        manifest["label"] = label
+    manifest_path = _undo_dir(job_dir) / MANIFEST_NAME
+    temp_name: Optional[str] = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            dir=str(manifest_path.parent), prefix=".manifest.", suffix=".tmp"
+        )
+        # mkstemp creates 0600; keep the manifest's existing mode (AGENTS.md).
+        try:
+            mode = manifest_path.stat().st_mode & 0o7777
+        except OSError:
+            mode = default_file_mode()
+        with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), mode)
+            json.dump(manifest, handle)
+        os.replace(temp_name, manifest_path)
+    except OSError as exc:
+        logger.warning("Could not extend the undo checkpoint: %s", exc)
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+        return False
+    return True
 
 
 class UndoUnavailable(RuntimeError):
@@ -332,7 +460,7 @@ def _restore_file(source: Path, destination: Path) -> None:
 def _restore_snapshot(job_dir: Path, checkpoint: Path,
                       present: List[str], absent: List[str]) -> None:
     """Restore all snapshot paths, rolling every changed path back on failure."""
-    rollback = Path(tempfile.mkdtemp(dir=str(job_dir), prefix=PENDING_PREFIX + "restore."))
+    rollback = _make_staging_dir(job_dir, PENDING_PREFIX + "restore.")
     paths = list(dict.fromkeys(present + absent))
     previously_present = set()
     changed: List[str] = []

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import stat
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -21,8 +22,36 @@ from app.services.log_context import _current_context
 logger = logging.getLogger(__name__)
 ARCHIVE_DIR = Path(__file__).resolve().parents[2] / "var" / "logs" / "api-responses"
 _SENSITIVE = re.compile(r"password|secret|token|authorization|cookie|api.?key|client.?secret|session|^code$|^key$", re.I)
+# Alan 11/4/26 - cf-ray is Cloudflare's per-request id, which Cloudflare and
+# the upstream's own logs both carry. MycoMap.org's 401s send no x-request-id,
+# so without it a refused call could only be matched to their logs by time and
+# user agent. It identifies the request, not the caller, so it is safe to keep.
 _HEADERS = {"content-type", "content-length", "date", "retry-after", "x-request-id",
-            "x-correlation-id", "age", "etag", "last-modified", "cache-control"}
+            "x-correlation-id", "age", "etag", "last-modified", "cache-control",
+            "cf-ray", "server"}
+
+
+def _archive_directory(now):
+    """Share date folders between CLI captures and the web/worker account."""
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    directory = ARCHIVE_DIR / now.strftime("%Y-%m-%d")
+    directory.mkdir(mode=0o770, exist_ok=True)
+    info = directory.stat()
+    if info.st_uid == os.geteuid():
+        # CLI processes may have a different primary group. Inherit the
+        # archive's shared group explicitly even when its parent lacks setgid.
+        # Best effort: the workers run with RestrictSUIDSGID=yes, which refuses
+        # the setgid chmod with EPERM, and that must not cost the archive itself.
+        try:
+            shared_gid = ARCHIVE_DIR.stat().st_gid
+            if info.st_gid != shared_gid:
+                os.chown(directory, -1, shared_gid)
+            mode = stat.S_IMODE(info.st_mode) | stat.S_ISGID | stat.S_IRWXG
+            if mode != stat.S_IMODE(info.st_mode):
+                directory.chmod(mode)
+        except OSError:
+            pass
+    return directory
 
 
 def safe_url(url):
@@ -84,8 +113,7 @@ def record_api_failure(url, *, reason, body=None, status=None, headers=None, met
                 pass
         now = datetime.now(timezone.utc)
         diagnostic_id = uuid.uuid4().hex
-        directory = ARCHIVE_DIR / now.strftime("%Y-%m-%d")
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = _archive_directory(now)
         path = directory / f"{diagnostic_id}.json.gz"
         context = _current_context()
         # Stable user IDs are preferable, but existing request correlation may
@@ -104,6 +132,9 @@ def record_api_failure(url, *, reason, body=None, status=None, headers=None, met
                 archive.write(json.dumps(payload, ensure_ascii=True).encode("utf-8"))
         logger.warning("event=api.response_failed diagnostic=%s status=%s endpoint=%s reason=%s",
                        diagnostic_id, status, safe_url(url), _redact(reason, secrets))
+        from flask import g, has_request_context
+        if has_request_context():
+            g.upstream_diagnostic_id = diagnostic_id
         return diagnostic_id
     except Exception as exc:
         logger.warning("event=api.diagnostic_write_failed error_type=%s", type(exc).__name__)
@@ -129,9 +160,18 @@ def diagnostic_urlopen(req, *args, opener=None, **kwargs):
     """Preserve retry behavior and HTTPError bodies for existing callers."""
     url = req.full_url if isinstance(req, request.Request) else str(req)
     method = req.get_method() if isinstance(req, request.Request) else "GET"
+    from app.services import ncbi_pacing
+    import time
+    timeout = kwargs.get("timeout")
+    deadline = time.monotonic() + timeout if isinstance(timeout, (int, float)) else None
+    ncbi_pacing.wait_for_slot(url, deadline=deadline)
+    if deadline is not None and ncbi_pacing.is_eutils(url):
+        kwargs["timeout"] = max(0.001, deadline - time.monotonic())
     try:
         response = (opener or request.urlopen)(req, *args, **kwargs)
     except error.HTTPError as exc:
+        if exc.code == 429:
+            ncbi_pacing.note_cooldown(url, exc.headers.get("Retry-After") if exc.headers else None)
         raw = None
         try:
             raw = exc.read()

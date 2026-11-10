@@ -214,6 +214,38 @@ class ScannerClassificationTests(unittest.TestCase):
             (aimed, aimed_reason), (BUCKET_TARGETED, "path_traversal_app_surface")
         )
 
+    def test_off_by_slash_probe_is_generic_traversal_not_aimed_at_us(self):
+        # Alan 11/8/26 - /static../ is the stock nginx alias probe every scanner
+        # tries against the same directory names; only a traversal that starts
+        # INSIDE one of our routes is the app-surface kind.
+        for path in ("/static../.git/config", "/js../.git/config"):
+            self.assertEqual(
+                classify_request_failure(path=path, status=404),
+                (BUCKET_TARGETED, "path_traversal"), path,
+            )
+        self.assertEqual(
+            classify_request_failure(path="/static/../../app/config.py", status=404),
+            (BUCKET_TARGETED, "path_traversal_app_surface"),
+        )
+
+    def test_a_scanner_word_in_the_job_id_slot_is_scanner_noise(self):
+        # Alan 11/8/26 - /job/.env is a .env sweep appending its dictionary to
+        # /job/, not someone testing the id parser.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/.env", status=400, matched_route="/job/<job_id>",
+                job_id_valid=False,
+            ),
+            (BUCKET_SCANNER, "known_scanner_path"),
+        )
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/AAAA'", status=400, matched_route="/job/<job_id>",
+                job_id_valid=False,
+            ),
+            (BUCKET_TARGETED, "job_id_malformed"),
+        )
+
     def test_an_ordinary_user_error_is_neither(self):
         bucket, reason = classify_request_failure(
             path="/whats-new", method="GET", status=404, matched_route=None,

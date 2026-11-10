@@ -1,8 +1,9 @@
-"""Read public MycoMap.org BLAST results without following user supplied URLs."""
+"""Submit MycoMap.org BLAST searches and read results through fixed API paths."""
 
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -23,13 +24,100 @@ _JOB_LINK = re.compile(r"(?:/|%2F)(\d+)(?:/?$|[?&#])", re.I)
 _LOCAL_XML_ID = re.compile(r"/local_(\d+)_xml\.", re.I)
 # The rerun endpoint accepts only these hit counts (MycoMap.org PR #9).
 RERUN_MAX_HITS = (50, 100, 250, 500)
+# MycoMap.org's public MycoBLAST form accepts one 50-20,000 bp query.
+SEARCH_MIN_QUERY_LENGTH = 50
+SEARCH_MAX_QUERY_LENGTH = 20_000
+SEARCH_POLL_INTERVAL_SECONDS = 2
+SEARCH_REQUEST_BUDGET_SECONDS = 200
+SEARCH_AUTH_KEY_PREFIX = "dikarya:mycomap-org:submit-auth:"
+
+
+def _search_auth_key():
+    key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
+    return SEARCH_AUTH_KEY_PREFIX + hashlib.sha256(key.encode()).hexdigest()
+
+
+def search_availability():
+    """Report a known refusal without probing upstream or exposing credentials."""
+    message = "MycoMap BLAST is temporarily unavailable. Use NCBI BLAST while access is restored."
+    if not (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip():
+        return {"available": False, "message": message, "retry_after": 600}
+    try:
+        from app.services.ncbi_pacing import connection
+        remaining = connection().ttl(_search_auth_key())
+        if remaining > 0:
+            return {"available": False, "message": message, "retry_after": remaining}
+    except Exception:
+        pass
+    return {"available": True, "message": "", "retry_after": 0}
+
+
+def _remember_search_refusal():
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(_search_auth_key(), "refused", ex=600)
+    except Exception:
+        logger.warning("event=mycomap_org.availability_store_failed")
 
 
 class OrgResultError(Exception):
-    def __init__(self, message, status=502, retryable=True):
+    def __init__(self, message, status=502, retryable=True, retry_after=None,
+                 key_refused=False):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        # Seconds from a 429's Retry-After, when MycoMap.org sent one.
+        self.retry_after = retry_after
+        # A 401/403 answering a request that carried Dikarya's X-API-Key.
+        self.key_refused = key_refused
+
+
+# MycoMap.org limits genbank-curation per client ("Too many GenBank lookups in
+# a short time", 429 with Retry-After; ~30 requests per 10 minutes from this
+# host on 2026-11-08). Every GenBank fetch asks it for curated names, so once
+# refused, all processes stop asking until the wait is over instead of each
+# one collecting its own 429.
+CURATION_PAUSE_KEY = "dikarya:mycomap-org:genbank-curation-paused"
+# Dikarya's key is exempt from that limit once a MycoMap.org admin marks it
+# (MycoMap.org PR #17; an exempt answer carries X-MycoMap-Rate-Limit: exempt).
+# The key is an optimisation there, never a requirement: a 401 (invalid) or
+# 403 (pending/disabled) is remembered here for 10 minutes, during which the
+# lookups go out anonymously, under the ordinary limit, as they did before.
+CURATION_KEY_REFUSED_KEY = "dikarya:mycomap-org:genbank-curation-key-refused"
+
+
+def curation_paused_for():
+    """Seconds left before genbank-curation may be asked again, or 0."""
+    try:
+        from app.services.ncbi_pacing import connection
+        remaining = connection().ttl(CURATION_PAUSE_KEY)
+        return remaining if remaining and remaining > 0 else 0
+    except Exception:
+        return 0
+
+
+def _curation_key_refused():
+    try:
+        from app.services.ncbi_pacing import connection
+        return bool(connection().exists(CURATION_KEY_REFUSED_KEY))
+    except Exception:
+        return False
+
+
+def _remember_curation_key_refusal():
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(CURATION_KEY_REFUSED_KEY, "refused", ex=600)
+    except Exception:
+        logger.warning("event=mycomap_org.curation_key_store_failed")
+
+
+def _pause_curation(seconds):
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(CURATION_PAUSE_KEY, "rate_limited", ex=max(1, min(int(seconds), 3600)))
+    except Exception:
+        logger.warning("event=mycomap_org.curation_pause_store_failed")
 
 
 def deferral_details(exc):
@@ -49,8 +137,13 @@ def deferral_details(exc):
 
 
 def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
-          authenticated=False, deadline=None, timeout=15):
-    """Only fixed API paths are accepted; no URL from a result is fetched."""
+          authenticated=False, send_key=False, deadline=None, timeout=15):
+    """Only fixed API paths are accepted; no URL from a result is fetched.
+
+    ``authenticated`` requires MYCOMAP_ORG_API_KEY; ``send_key`` sends it when
+    it is configured (the web and worker units have it, the tree user's cron
+    does not) and goes anonymous otherwise.
+    """
     # ":" is for observation references (inat:123) in a query string.
     if not re.fullmatch(r"[a-z0-9/?=&,:_-]+", path, re.I) or ".." in path:
         raise OrgResultError("Invalid MycoMap API path.", 400)
@@ -60,10 +153,15 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
+    key = ""
+    if send_key and not authenticated:
+        key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
+        if key:
+            headers["X-API-Key"] = key
     if authenticated:
         key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
         if not key:
-            raise OrgResultError("MycoMap.org rerun key is not configured.", 502,
+            raise OrgResultError("MycoMap.org access key is not configured.", 502,
                                  retryable=False)
         # Alan 10/7/26 - MycoMap.org reads an API key only from X-API-Key, raw,
         # with no "Bearer " prefix. Authorization: Bearer there carries mobile-app
@@ -72,6 +170,10 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         # rerun route itself also took session cookies only until MycoMap.org
         # PR #9 moved it to requireAuthOrApiKey.)
         headers["X-API-Key"] = key
+        if path == "submit":
+            availability = search_availability()
+            if not availability["available"]:
+                raise OrgResultError(availability["message"], 502, retryable=False)
     base = ORG_API_ROOT if path.startswith(("mycomap/", "admin/")) else ORG_API
     request = urllib.request.Request(
         f"{base}/{path}",
@@ -100,23 +202,35 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
             logger.warning("event=mycomap_org.rate_limited path=%s retry_after=%s",
                            path.split("?", 1)[0], retry_after.strip()[:10] or "-")
             raise OrgResultError(
-                "MycoMap.org's rerun limit was reached; Dikarya will try again shortly.",
+                ("MycoMap.org's search limit was reached; please try again shortly."
+                 if path == "submit" else
+                 "MycoMap.org's GenBank lookup limit was reached."
+                 if path == "genbank-curation" else
+                 "MycoMap.org's rerun limit was reached; Dikarya will try again shortly."),
                 502,
+                retry_after=int(retry_after.strip()) if retry_after.strip().isdigit() else None,
             ) from exc
         if exc.code in (401, 403):
-            if authenticated:
+            if key:
+                if path == "submit":
+                    _remember_search_refusal()
                 logger.error(
                     "event=mycomap_org.auth_refused status=%s path=%s "
                     "key_env=MYCOMAP_ORG_API_KEY key_len=%s key_sha256=%s",
                     exc.code, path.split("?", 1)[0], len(key),
                     hashlib.sha256(key.encode()).hexdigest()[:12],
                 )
-                message = (f"MycoMap.org did not accept Dikarya's access key "
-                           f"(HTTP {exc.code}).")
+                message = (
+                    "MycoMap.org is not accepting new BLAST searches from Dikarya. "
+                    "You can use NCBI BLAST meanwhile."
+                    if path == "submit" else
+                    f"MycoMap.org did not accept Dikarya's access key (HTTP {exc.code})."
+                )
             else:
                 message = (f"MycoMap.org refused access to this BLAST result "
                            f"(HTTP {exc.code}).")
-            raise OrgResultError(message, 502, retryable=False) from exc
+            raise OrgResultError(message, 502, retryable=False,
+                                 key_refused=bool(key)) from exc
         raise OrgResultError(
             "MycoMap.org has no matching BLAST result." if exc.code == 404
             else "MycoMap.org could not complete the BLAST request.",
@@ -165,6 +279,129 @@ def status(result_id):
     return _json(result_id)
 
 
+def _search_query(query):
+    """Normalize one raw/FASTA query or an individual GenBank accession.
+
+    Match the public MycoBLAST form's bounds before creating an upstream job.
+    Headers and comments are discarded locally rather than sent to MycoMap.
+    """
+    from app.services.fasta_utils import is_insdc_master_accession
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Enter a DNA sequence or GenBank accession to search.")
+    query = query.strip()
+    if is_genbank_accession(query):
+        if is_insdc_master_accession(query):
+            raise ValueError(
+                "That accession is a project record with no sequence; enter an "
+                "individual sequence accession instead."
+            )
+        return "genbank", query.upper()
+    lines = [line.strip() for line in query.splitlines() if line.strip()]
+    if sum(line.startswith(">") for line in lines) > 1:
+        raise ValueError("MycoMap BLAST searches one sequence at a time; paste a single FASTA record.")
+    sequence = re.sub(r"[\s\d]", "", "".join(
+        line for line in lines if not line.startswith((">", ";"))
+    )).upper()
+    if not sequence or not re.fullmatch(r"[ACGTURYKMSWBDHVN]+", sequence):
+        raise ValueError("Enter a DNA sequence containing only nucleotide codes, or a GenBank accession.")
+    sequence = sequence.replace("U", "T")
+    if not any(base in sequence for base in "ACGT"):
+        raise ValueError("The sequence needs at least one A, C, G or T base.")
+    if len(sequence) < SEARCH_MIN_QUERY_LENGTH:
+        raise ValueError(f"MycoMap BLAST needs at least {SEARCH_MIN_QUERY_LENGTH} sequence bases.")
+    if len(sequence) > SEARCH_MAX_QUERY_LENGTH:
+        raise ValueError(f"MycoMap BLAST accepts up to {SEARCH_MAX_QUERY_LENGTH:,} sequence bases.")
+    return "sequence", sequence
+
+
+def search_from_query(query, *, min_identity=90.0, max_sequences=50,
+                      time_budget=SEARCH_REQUEST_BUDGET_SECONDS):
+    """Search MycoMap.org's local database and return import-ready full hits.
+
+    ``submit`` creates a BLAST search, not a persistent sequence record. The
+    contract is the one used by MycoMap.org's public MycoBLAST page: type/input,
+    limit and localOnly. The installed server key stays on this server. A
+    single deadline covers submission, polling, XML and full-sequence fetches.
+    """
+    query_type, normalized_query = _search_query(query)
+    try:
+        identity = float(min_identity)
+    except (TypeError, ValueError):
+        identity = 90.0
+    if not math.isfinite(identity):
+        identity = 90.0
+    identity = max(50.0, min(100.0, identity))
+    try:
+        limit = int(max_sequences)
+    except (TypeError, ValueError, OverflowError):
+        limit = 50
+    limit = max(1, min(500, limit))
+    try:
+        budget = float(time_budget)
+    except (TypeError, ValueError):
+        budget = 0
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("MycoMap BLAST needs a positive request time budget.")
+    deadline = time.monotonic() + budget
+
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("MycoMap.org BLAST did not finish in time.")
+        return seconds
+
+    try:
+        submitted = json.loads(_read(
+            "submit", method="POST", authenticated=True, deadline=deadline,
+            body={"type": query_type, "input": normalized_query,
+                  "limit": rerun_max_hits(limit), "localOnly": True},
+        ))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise OrgResultError("MycoMap.org returned an invalid search response.") from exc
+    result_id = str(submitted.get("job_id") or "") if isinstance(submitted, dict) else ""
+    if not re.fullmatch(r"[1-9]\d{0,11}", result_id):
+        raise OrgResultError("MycoMap.org did not return a valid BLAST search ID.")
+    logger.info("event=mycomap_org.search_submitted result_id=%s query_type=%s "
+                "max_hits=%s min_identity=%s", result_id, query_type, limit, identity)
+
+    while True:
+        remaining()
+        record = _json(result_id, deadline=deadline)
+        local = record.get("local") or {}
+        if not isinstance(local, dict):
+            raise OrgResultError("MycoMap.org returned invalid local BLAST status.")
+        local_state = str(local.get("status") or "").lower()
+        overall_state = str(record.get("status") or "").lower()
+        if local_state in {"failed", "failure", "error"} or overall_state in {
+            "failed", "failure", "error"
+        }:
+            raise OrgResultError("MycoMap.org could not complete the local BLAST search.",
+                                 retryable=False)
+        if local_state not in {"queued", "pending", "running", "processing"}:
+            if local.get("has_results"):
+                break
+            if local_state in {"done", "complete", "completed"} or overall_state in {
+                "done", "complete", "completed"
+            }:
+                raise OrgResultError("MycoMap.org finished the search without publishing BLAST results.")
+        time.sleep(min(SEARCH_POLL_INTERVAL_SECONDS, remaining()))
+
+    result = fetch_results(result_id, include_ncbi=False, include_local=True,
+                           time_budget=remaining())
+    remaining()
+    if result.get("failed_sources") or result.get("pending_sources") or result.get("errors"):
+        raise OrgResultError("MycoMap.org could not load the completed local BLAST results.")
+    result["sequences"] = [
+        hit for hit in result.get("sequences", [])
+        if hit.get("identity") is not None and hit["identity"] >= identity
+    ][:limit]
+    result["local_count"] = len(result["sequences"])
+    result["result_id"] = result_id
+    result["result_url"] = f"https://mycomap.org/mycoblast/{result_id}"
+    return result
+
+
 def rerun_pending(details):
     """Check requested rerun sources against the saved pre-rerun XML dates.
 
@@ -209,6 +446,58 @@ def rerun_pending(details):
         return True
     details["org_wait_sources"] = []
     return False
+
+
+# How long a local rerun is polled in place before the caller falls back to a
+# deferred wait. Every logged local rerun has published at the first check,
+# 3.3-4.2 s after the request (event=mycomap_org.local_rerun_wait).
+LOCAL_RERUN_INLINE_WAIT_SECONDS = 30
+
+
+def local_rerun_poll_delay(elapsed):
+    """Seconds until the next check of a MycoMap.org local rerun.
+
+    Most local reruns publish in 3-4 s, so the first check waits 3 s, then
+    every second until 10 s, then every 3 s. Tune against the elapsed_seconds
+    that event=mycomap_org.local_rerun_wait records.
+    """
+    if elapsed < 3:
+        return 3 - elapsed
+    return 1 if elapsed < 10 else 3
+
+
+def wait_for_local_rerun(details, on_check=None):
+    """Poll a requested local rerun for up to LOCAL_RERUN_INLINE_WAIT_SECONDS.
+
+    Updates ``details`` exactly as rerun_pending() does and returns
+    ``(outcome, elapsed_seconds, checks)``; outcome is "ready", "failed",
+    "error" (a check raised; the deferred path reports it) or "deferred".
+    An NCBI rerun alongside is left pending: it takes minutes, not seconds.
+    """
+    started = time.monotonic()
+    checks = 0
+    outcome = "deferred"
+    while True:
+        elapsed = time.monotonic() - started
+        delay = local_rerun_poll_delay(elapsed)
+        if elapsed + delay > LOCAL_RERUN_INLINE_WAIT_SECONDS:
+            break
+        time.sleep(delay)
+        checks += 1
+        try:
+            still_pending = rerun_pending(details)
+        except OrgResultError:
+            outcome = "error"
+            break
+        if on_check:
+            on_check(details)
+        if details.get("org_source_states", {}).get("local") != "running":
+            outcome = "ready" if details.get("local_status") != "failed" else "failed"
+            break
+        if not still_pending:
+            outcome = "ready"
+            break
+    return outcome, time.monotonic() - started, checks
 
 
 def rerun_max_hits(limit):
@@ -358,7 +647,7 @@ def _ncbi_sequences(accessions, *, deadline=None):
             break
         try:
             response = _ncbi_request(
-                "POST", NCBI_EFETCH_URL, max_retries=1,
+                "POST", NCBI_EFETCH_URL, max_retries=2, deadline=deadline,
                 data={"db": "nuccore", "id": ",".join(batch),
                       "rettype": "fasta", "retmode": "text"},
                 timeout=(min(5, remaining), min(20, remaining)), stream=True,
@@ -399,6 +688,8 @@ def _ncbi_sequences(accessions, *, deadline=None):
                                  if key.split(".")[0] == accession), None)
             if sequence:
                 sequences[accession] = sequence
+    logger.info("event=import.source_summary operation=mycomap_full_sequences source=ncbi expected=%s fetched=%s omitted=%s unchecked=%s",
+                len(requested), len(sequences), len(requested) - len(sequences), len(unchecked))
     return sequences, unchecked
 
 
@@ -410,30 +701,75 @@ _DEFLINE_QUALIFIER = re.compile(
     r"culture-collection|cultivar|genotype|from)\s", re.I)
 
 
-def _curated_genbank_names(accessions, *, deadline=None):
-    """MycoMap's curated name for each GenBank accession, keyed by accession.
+def curated_genbank_rows(accessions, *, deadline=None, strict=False):
+    """MycoMap.org's curation row for each GenBank accession, keyed by bare accession.
 
     POST mycoblast/genbank-curation is public and is what MycoMap.org's own
     BLAST page labels NCBI hits with: curators rename GenBank records there
-    (OM691497 "Geoglossum sp. SA-2022a" -> "Geoglossum laurisilvae") without
-    GenBank changing. Best effort -- on failure the GenBank names stand.
+    (OM691497 "Geoglossum sp. SA-2022a" -> "Geoglossum laurisilvae";
+    OP739129 "Podaxis pistillaris" -> "Podaxis inyoensis") without GenBank
+    changing. Each row is ``{scientificName, location, isType, typeBasis}``;
+    every answer is also handed to the type-specimen cache, so a type a curator
+    designated on MycoMap.org is marked in the viewer.
+
+    Best effort: on failure the remaining batches are skipped and the caller
+    keeps the GenBank names, unless ``strict`` (the refresh backfill), which
+    raises the batch's error instead. While MycoMap.org's rate-limit wait is
+    running (``curation_paused_for()``) nothing is asked at all.
     """
-    names = {}
-    unique = list(dict.fromkeys(a for a in accessions if a))
+    rows = {}
+    unique = list(dict.fromkeys(str(a).strip() for a in accessions if a and str(a).strip()))
+    paused = curation_paused_for() if unique else 0
+    if paused:
+        if strict:
+            raise OrgResultError("MycoMap.org's GenBank lookup limit was reached.",
+                                 502, retry_after=paused)
+        logger.info("event=mycomap_org.genbank_curation_paused retry_after=%s count=%s",
+                    paused, len(unique))
+        return rows
+    send_key = not _curation_key_refused()
     for offset in range(0, len(unique), CURATION_BATCH_SIZE):
         batch = unique[offset:offset + CURATION_BATCH_SIZE]
         try:
-            payload = json.loads(_read("genbank-curation", method="POST",
-                                       body={"accessions": batch}, deadline=deadline))
-        except (OrgResultError, ValueError, UnicodeDecodeError):
+            try:
+                payload = json.loads(_read("genbank-curation", method="POST", send_key=send_key,
+                                           body={"accessions": batch}, deadline=deadline))
+            except OrgResultError as exc:
+                if not exc.key_refused:
+                    raise
+                # _read logged auth_refused with the key's fingerprint. Ask
+                # again anonymously; the names matter more than the exemption.
+                _remember_curation_key_refusal()
+                send_key = False
+                payload = json.loads(_read("genbank-curation", method="POST",
+                                           body={"accessions": batch}, deadline=deadline))
+        except (OrgResultError, ValueError, UnicodeDecodeError) as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after:
+                _pause_curation(retry_after)
+            if strict:
+                raise
+            # _read already logged a rate limit; a trace adds nothing to it.
             logger.warning("event=mycomap_org.genbank_curation_unavailable count=%s",
-                           len(batch), exc_info=True)
+                           len(batch), exc_info=not retry_after)
             break
         results = payload.get("results") if isinstance(payload, dict) else None
-        for key, row in (results or {}).items():
-            name = str((row or {}).get("scientificName") or "").strip() if isinstance(row, dict) else ""
-            if name:
-                names[str(key).upper().split(".")[0]] = name
+        for key, row in (results or {}).items() if isinstance(results, dict) else ():
+            if isinstance(row, dict):
+                rows[str(key).upper().split(".")[0]] = row
+    if rows:
+        from app.services.type_specimen_service import remember_mycomap_curation
+        remember_mycomap_curation(rows)
+    return rows
+
+
+def _curated_genbank_names(accessions, *, deadline=None):
+    """MycoMap's curated name for each GenBank accession, keyed by bare accession."""
+    names = {}
+    for accession, row in curated_genbank_rows(accessions, deadline=deadline).items():
+        name = " ".join(str(row.get("scientificName") or "").split())
+        if name:
+            names[accession] = name
     return names
 
 
@@ -681,7 +1017,16 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 if curated_label:
                     name, taxon = curated_label, curated
             else:
-                name = f"{hit['id']} {observation_token} {taxon or hit['description']}"
+                # MycoMap.org identifies local hits with its own sequence ID.
+                # A bare numeric ID such as ``833182`` looks exactly like a
+                # GenBank accession with its letter prefix stripped, which led
+                # users to conclude both that local hits were absent and that
+                # GenBank labels had been damaged. Keep the upstream ID, but
+                # make its namespace explicit in every exported tree label.
+                name = (
+                    f"MycoMap#{hit['id']} {observation_token} "
+                    f"{taxon or hit['description']}"
+                )
             name = name.strip()
             if source == "ncbi":
                 sequence = hit["full_sequence"]
@@ -703,4 +1048,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
         result[f"{source}_count"] = sum(
             sequence["hit_source"] == source for sequence in result["sequences"]
         )
+        logger.info("event=import.source_summary operation=mycomap_org source=%s expected=%s fetched=%s omitted=%s",
+                    source, len(hits), result[f"{source}_count"],
+                    max(0, len(hits) - result[f"{source}_count"]))
     return result

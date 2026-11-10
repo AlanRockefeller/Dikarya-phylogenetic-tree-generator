@@ -23,7 +23,7 @@ from app.services import tree_builder_service as tbs
 
 JOB_ID = "12345678-1234-1234-1234-123456789abc"
 
-FASTA = ">A\nACGTACGTAC\n>B\nACGTACGTAT\n>C\nACGTACGTAA\n"
+FASTA = ">A\nACGTACGTAC\n>B\nACGTACGTAT\n>C\nACGTACGTAA\n>D\nACGTACGTAG\n"
 
 
 # ---------------------------------------------------------------------------

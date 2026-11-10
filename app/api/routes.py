@@ -12,6 +12,7 @@ from app.config import Config
 from app.extensions import db
 from app.models import Job
 import logging
+import math
 import re
 import hashlib
 import time
@@ -30,6 +31,7 @@ from app.services.fasta_utils import (
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
     quick_tree_length_error,
+    submitted_tree_count_error,
     validate_iqtree_ufboot_count,
 )
 from app.services.artifact_storage import (
@@ -57,6 +59,40 @@ logger = logging.getLogger(__name__)
 
 
 CLIENT_LOG_MAX_STR = 120
+
+
+@bp.route('/fasta/check', methods=['POST'])
+@limiter.limit("60 per minute; 1000 per day")
+def check_fasta_input():
+    """Validate before queueing and offer an explicit formatting preview."""
+    from app.services.fasta_utils import analyze_dna_fasta
+    from app.services.fasta_input_service import record_fasta_rejection, propose_fasta_repair
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("sequence"), str):
+        return jsonify({"error": "Provide FASTA text in the sequence field."}), 400
+    text = data["sequence"]
+    source = "browser_upload" if data.get("source") == "upload" else "browser_paste"
+    filename = data.get("filename") if isinstance(data.get("filename"), str) else None
+    analysis = analyze_dna_fasta(text)
+    accessions, invalid = _parse_genbank_accession_tokens(text)
+    is_accession_list = bool(accessions) and not invalid
+    diagnostic = None
+    # An accession list is valid input here (the dialog offers to fetch it),
+    # not a rejected FASTA, so it gets no WARNING and no archive.
+    if not analysis["valid"] and not is_accession_list:
+        diagnostic = record_fasta_rejection(text, analysis, source=source, filename=filename)
+    # analyze_dna_fasta stops before its per-character scan on oversized input;
+    # the repair proposal's line scans would not, so skip it there too.
+    oversized = any(issue.get("code") in _FASTA_SIZE_ISSUE_CODES
+                    for issue in analysis["issues"])
+    return jsonify({**analysis, "diagnostic_id": diagnostic,
+                    "input_kind": "accessions" if is_accession_list else "fasta",
+                    "accession_count": len(accessions) if not invalid else 0,
+                    "repair": None if oversized else propose_fasta_repair(text)})
+
+
+# The issue codes analyze_dna_fasta() reports for check_fasta_size_limits().
+_FASTA_SIZE_ISSUE_CODES = frozenset({"too_many_records", "sequence_too_long", "too_many_bases"})
 
 
 def _server_error(exc, *, where=""):
@@ -285,6 +321,12 @@ def _normalize_sequence_metadata(raw_items):
             mycomap_sequence_id = 0
         if mycomap_sequence_id > 0:
             row["mycomap_sequence_id"] = mycomap_sequence_id
+        # Alan 11/9/26 - Provenance of a curator-labelled MycoMap record; stored
+        # only when present so ordinary rows stay as small as before.
+        for field, limit in (("mycomap_record_id", 100), ("mycomap_dataset", 300)):
+            value = " ".join(str(raw.get(field) or "").split())[:limit]
+            if value:
+                row[field] = value
         row["blast_metrics_available"] = bool(raw.get("blast_metrics_available")) or any(
             row[field] is not None
             for field in ("identity", "query_cover", "subject_cover")
@@ -528,15 +570,90 @@ def _extract_mycomap_query_tokens(url):
 
 
 def _mycomap_metric_for_sequence(seq, metrics_by_key):
-    """Return the MycoMap BLAST table metric associated with one FASTA record."""
-    from app.services.mycomap_service import build_blast_metric_keys
+    """Return the MycoMap BLAST table metric associated with one FASTA record.
 
-    for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
-        for key in build_blast_metric_keys(lookup_name):
+    Alan 11/9/26 - A local record takes its BLAST numbers from its OWN results
+    row (matched by exact description) when the page lists it. A curator label
+    is otherwise matched only through tokens outside its notes, never through
+    its genus word: "(... matchto TYPE CA KX812826) DQ367913" used to take the
+    type's identity and coverage. When the own row has no name badge, the
+    name and location come from the observation or GenBank row the label
+    names outside its notes, which describes the same specimen.
+    """
+    from app.services.mycomap_service import (
+        _strip_header_notes, build_blast_metric_keys, local_row_description_key,
+    )
+
+    names = (seq.get('name', ''), seq.get('_mycomap_original_name', ''))
+    local = seq.get('hit_source') == 'local'
+    own = None
+    if local:
+        for name in names:
+            key = local_row_description_key(name)
+            if key and key in metrics_by_key:
+                own = metrics_by_key[key]
+                break
+
+    related = None
+    for lookup_name in names:
+        text = str(lookup_name or '')
+        tokens = text.lstrip('>').split()
+        curator = local and bool(tokens) and not re.search(r'\d', tokens[0])
+        skip = set(build_blast_metric_keys(tokens[0])) if curator else set()
+        if curator:
+            text = _strip_header_notes(text)
+        for key in build_blast_metric_keys(text):
+            if key in skip:
+                continue
             metric = metrics_by_key.get(key)
             if metric:
-                return metric
-    return None
+                related = metric
+                break
+        if related:
+            break
+
+    genus_disagrees = (local and related is not None
+                       and _curator_genus_disagrees(seq, own or {}, related))
+    if own is None:
+        if genus_disagrees:
+            # Off the page (only the top 100 rows are listed): still never
+            # relabel the record with the other genus.
+            related = {key: value for key, value in related.items()
+                       if key not in ('species_name', 'mycomap_location', 'display_name')}
+        return related
+    merged = dict(own)
+    merged['own_row'] = True
+    if ((own.get('species_from_label') or not own.get('species_name'))
+            and related is not None and related is not own
+            and related.get('species_name') and not related.get('species_from_label')
+            and not genus_disagrees):
+        for field in ('species_name', 'mycomap_location', 'display_name'):
+            if related.get(field):
+                merged[field] = related[field]
+    return merged
+
+
+def _curator_genus_disagrees(seq, own, related):
+    """Return true when a curator record and the row it names differ on genus.
+
+    Alan 11/9/26 - Within one genus the observation's current MycoMap name
+    wins: curator annotations are a snapshot, and "Galerina smithii ...
+    iNat162755648" is now correctly Galerina laticeps. A different genus means
+    the sequence does not belong to that name -- "Pholiotina 'rugosa PNW01'
+    (error: as Hypholoma dispersum) iNat17859197" is a Pholiotina sequence
+    filed on a Hypholoma observation -- so the curator's name stands, and
+    nothing else is taken from that row either.
+    """
+    curator_name = str(own.get('species_name') or '') if own.get('species_from_label') else ''
+    curator_genus = (curator_name.split() or [''])[0]
+    if not curator_genus:
+        tokens = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lstrip('>').split()
+        # Only a spelled-out genus; "P." could be any of several.
+        if tokens and re.fullmatch(r'[A-Z][a-z]{2,}', tokens[0]):
+            curator_genus = tokens[0]
+    related_genus = (str(related.get('species_name') or '').split() or [''])[0]
+    return bool(curator_genus and related_genus
+                and curator_genus.casefold() != related_genus.casefold())
 
 
 def _mycomap_sequence_location(seq, metric=None):
@@ -1473,6 +1590,76 @@ def run_blast():
     return _run_in_background_if_asked("blast", _run_blast_request, data)
 
 
+@bp.post('/mycomap/blast')
+@limiter.limit("10 per minute; 200 per hour")
+def run_mycomap_blast():
+    """Search MycoMap.org's local database with one sequence or accession."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "error": "Provide a JSON object."}), 400
+    return _run_in_background_if_asked("mycomap_blast", _run_mycomap_blast_request, data)
+
+
+@bp.get('/mycomap/blast/status')
+@limiter.limit("60 per minute")
+def mycomap_search_availability():
+    from app.services.mycomap_org_service import search_availability
+    response = jsonify(search_availability())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _run_mycomap_blast_request(data):
+    from app.services.mycomap_org_service import OrgResultError, search_from_query
+
+    query = data.get('query')
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({"status": "error", "error": "Enter one sequence or GenBank accession."}), 400
+    try:
+        min_identity = float(data.get('min_identity', 90))
+        if not math.isfinite(min_identity):
+            raise ValueError
+        min_identity = max(50.0, min(100.0, min_identity))
+        max_sequences = max(1, min(500, int(data.get('max_sequences', 50))))
+    except (TypeError, ValueError, OverflowError):
+        return jsonify({"status": "error", "error": "Enter valid identity and result limits."}), 400
+
+    try:
+        result = search_from_query(
+            query, min_identity=min_identity, max_sequences=max_sequences,
+            time_budget=200,
+        )
+        payload, err = gather_mycomap_sequences_for_queue(
+            result['result_url'], include_ncbi=False, include_local=True,
+            fetch_time_budget=20,
+            prefetched_org_result=result,
+        )
+        if err is not None:
+            body, status = err
+            return jsonify(body), status
+        payload['mycomap_blast_url'] = result['result_url']
+        payload['warnings'] = result.get('warnings', [])
+        payload['message'] = (
+            f"MycoMap BLAST complete. Found {len(payload['sequences'])} related sequences."
+        )
+        return jsonify(payload)
+    except ValueError as exc:
+        note_request_failure("invalid_mycomap_blast_query")
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    except TimeoutError:
+        return jsonify({
+            "status": "error",
+            "error": "MycoMap BLAST is taking longer than expected. Please try again in a few minutes.",
+        }), 504
+    except OrgResultError as exc:
+        logger.warning("event=mycomap_org.search_failed status=%s retryable=%s",
+                       exc.status, exc.retryable)
+        return jsonify({"status": "error", "error": str(exc),
+                        "retryable": exc.retryable}), exc.status
+    except Exception as exc:
+        return _server_error(exc, where="mycomap_blast")
+
+
 def _run_in_background_if_asked(kind, handler, data):
     """Start ``handler(data)`` in the background when the page asked for it.
 
@@ -1510,10 +1697,18 @@ def background_request_status(task_id):
         }), 410
     if record.get("state") != "done":
         return jsonify({"status": "running"}), 202
-    return current_app.response_class(
+    response = current_app.response_class(
         record.get("body") or "", status=int(record.get("status") or 500),
         mimetype="application/json",
     )
+    origin = record.get("request_id")
+    if isinstance(origin, str) and re.fullmatch(r"[0-9a-f]{12}", origin):
+        response.headers["X-Origin-Request-Id"] = origin
+    response.headers["X-Background-Task-Id"] = task_id
+    elapsed = record.get("duration_ms")
+    if type(elapsed) is int and elapsed >= 0:
+        response.headers["X-Background-Duration-Ms"] = str(elapsed)
+    return response
 
 
 def _run_blast_request(data):
@@ -1591,12 +1786,23 @@ def _run_blast_request(data):
         # NCBI is slow, not broken: answer in JSON before nginx gives up at
         # 300s, so the Tree Builder shows this instead of failing to parse
         # nginx's HTML 504 page.
+        can_resume = bool(getattr(g, "blast_can_resume", False))
+        if can_resume and request.headers.get("X-Dikarya-BLAST-Pending") == "1":
+            message = (
+                "NCBI is still working on this search. Your search is saved; "
+                "click Continue NCBI BLAST to check for results."
+            )
+            logger.info("event=blast.pending rid=%s", getattr(g, "blast_rid", "-"))
+            return jsonify({"status": "pending", "can_resume": True,
+                            "message": message, "retry_after": 15}), 202
         logger.warning("BLAST request timed out: %s", e)
         return jsonify({
             "status": "error",
+            "can_resume": can_resume,
             "error": (
-                "NCBI BLAST did not finish in time. NCBI is busy right now; "
-                "please try again in a few minutes."
+                "NCBI is still working on this search. Click Continue NCBI BLAST to check the same search again."
+                if can_resume else
+                "NCBI BLAST did not finish in time. NCBI is busy right now; please try again in a few minutes."
             ),
         }), 504
     except Exception as e:
@@ -1802,7 +2008,8 @@ def _fill_missing_genbank_locations(sequences, deadline=None):
 def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True,
                                        filter_conflicting_local_fasta=False,
                                        allow_identical_sequences_different_locations=True,
-                                       fetch_time_budget=None):
+                                       fetch_time_budget=None,
+                                       prefetched_org_result=None):
     """Reusable helper for fetching MycoMap BLAST result sequences.
 
     Returns a tuple ``(payload, error_response)`` where ``payload`` is the
@@ -1817,6 +2024,9 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     running inside a request must pass one (see
     ``INTERACTIVE_FETCH_BUDGET_SECONDS``) so a MycoMap outage cannot hold a
     Gunicorn slot for the full retry budget; worker callers leave it None.
+
+    ``prefetched_org_result`` lets a newly completed MycoMap.org search use
+    the same import filters and metadata enrichment without fetching it twice.
     """
     if not url:
         return None, ({"status": "error", "error": "No URL provided"}, 400)
@@ -1978,7 +2188,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     if provider == "org":
         from app.services.mycomap_org_service import OrgResultError, fetch_results
         try:
-            result = fetch_results(
+            result = prefetched_org_result if prefetched_org_result is not None else fetch_results(
                 blast_id, include_ncbi=include_ncbi, include_local=include_local,
                 time_budget=fetch_time_budget,
             )
@@ -2197,6 +2407,13 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             )
             continue
         if metric:
+            # Alan 11/9/26 - MycoMap's record ID and the dataset a curator record
+            # came from are kept only from the record's own results row; another
+            # row's would describe a different record.
+            if metric.get('own_row'):
+                for field in ('mycomap_record_id', 'mycomap_dataset'):
+                    if metric.get(field):
+                        seq[field] = metric[field]
             seq['name'] = improve_mycomap_sequence_name(
                 seq.get('name', ''),
                 metric,
@@ -2204,6 +2421,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 accession=seq.get('accession', ''),
                 voucher=seq.get('voucher', ''),
                 location=seq.get('location', ''),
+                mycomap_record_id=seq.get('mycomap_record_id', ''),
             )
             if metric.get('species_name'):
                 seq['taxon'] = metric['species_name']
@@ -3235,27 +3453,29 @@ def create_job():
         job_params.get("mcmc_burnin_fraction"),
         Config.DEFAULT_MCMC_BURNIN_FRACTION, 0.0, 0.99
     )
+    # Validate and archive the ORIGINAL submission before deduplication can
+    # discard an empty record or move an error away from its submitted line.
+    submitted_count = None
+    if job_params.get("sequence"):
+        from app.services.fasta_utils import FastaValidationError
+        from app.services.fasta_input_service import validate_submitted_fasta
+        if not isinstance(job_params["sequence"], str):
+            return jsonify({"status": "error", "error": "sequence must be FASTA text."}), 400
+        try:
+            submitted_count = validate_submitted_fasta(job_params["sequence"], source="job_submission")
+        except FastaValidationError as exc:
+            note_request_failure("invalid_dna_fasta")
+            return jsonify({"status": "error", "error": str(exc),
+                            "fasta_validation": exc.analysis,
+                            "diagnostic_id": exc.diagnostic_id}), 400
+
     job_params["sequence"], job_params["sequence_metadata"] = _dedupe_sequence_payload(
         job_params.get("sequence", ""),
         job_params.get("sequence_metadata", []),
     )
 
-    # Reject a malformed FASTA here rather than in the worker. This validation
-    # used to live only in run_phylo_job, so a stray character on a sequence
-    # line was accepted with 202, queued, and only reported as a failed job
-    # once a worker picked it up -- the user waited for a run that could never
-    # have started. validate_dna_fasta is pure, so it is safe in-request.
-    #
-    # Only the pasted path is checked: a fasta_upload lands on disk separately
-    # and an accession/MycoMap import has no sequence text yet, both of which
-    # the worker still validates once it has the records in hand.
+    # Resolve the outgroup against the same deduplicated records the worker sees.
     if job_params.get("sequence"):
-        from app.services.fasta_utils import validate_dna_fasta
-        try:
-            validate_dna_fasta(job_params["sequence"])
-        except ValueError as e:
-            note_request_failure("invalid_dna_fasta")
-            return jsonify({"status": "error", "error": str(e)}), 400
         if tree_method == 'raxml' and job_params.get('outgroup'):
             try:
                 from app.services.fasta_utils import parse_fasta_records
@@ -3283,6 +3503,10 @@ def create_job():
     # owns before persisting, then enqueue with that preparation disabled. This
     # preserves the observable params while ensuring RQ cannot run first.
     prepare_phylo_job_params(job_params)
+    count_error = submitted_tree_count_error(job_params, submitted_count)
+    if count_error:
+        note_request_failure("too_few_sequences")
+        return jsonify({"status": "error", "error": count_error}), 400
     job_id = generate_job_id()
     g.job_id = job_id
     job_record = Job(
@@ -3390,8 +3614,9 @@ def prune_tree(job_id):
         tip_names = [data.get("tip_name")]
         
     if not tip_names:
+        note_request_failure("prune_no_targets")
         return jsonify({"status": "error", "error": "No tips specified"}), 400
-    
+
     try:
         from app.services.tree_edit_service import (
             PruneRequestError, _tree_tip_set, load_tree_state, prune_taxa, save_tree_state,
@@ -3416,6 +3641,9 @@ def prune_tree(job_id):
                     )
         return jsonify(_with_undo_state(state, job_dir))
     except PruneRequestError as e:
+        # Alan 11/8/26 - Say WHY in the request log (would empty the tree, none
+        # of the tips found); the message itself can carry tip names.
+        note_request_failure(e.failure_code)
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
@@ -3682,6 +3910,24 @@ def undo_tree_edit(job_id):
         return _server_error(e)
 
 
+@bp.route('/job/<job_id>/closest-type', methods=['GET'])
+def closest_type_specimen(job_id):
+    """The type tip in this tree closest to the sequence of interest (viewer callout)."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+    try:
+        from app.services.closest_type_service import closest_type_for_job
+        result = closest_type_for_job(Config.JOB_DIR / job_id)
+        response = jsonify({"status": "ok", **result})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception as e:
+        return _server_error(e, where="closest_type")
+
+
 @bp.route('/job/<job_id>/tree/rotate', methods=['POST'])
 def rotate_tree_node(job_id):
     if not validate_job_id(job_id):
@@ -3695,9 +3941,11 @@ def rotate_tree_node(job_id):
     data = request.get_json(silent=True) or {}
     node_id = data.get("node_id")
     if not isinstance(node_id, str) or not node_id.strip():
+        note_request_failure("rotate_node_id_missing")
         return jsonify({"status": "error", "error": "Missing node_id"}), 400
     node_id = node_id.strip()
     if len(node_id) > 256 or any(ord(char) < 32 for char in node_id):
+        note_request_failure("rotate_node_id_invalid")
         return jsonify({"status": "error", "error": "Invalid node_id"}), 400
 
     try:
@@ -3710,6 +3958,7 @@ def rotate_tree_node(job_id):
                 checkpoint.commit()
         return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
+        note_request_failure(getattr(e, "failure_code", None) or "rotate_refused")
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
@@ -3726,8 +3975,9 @@ def reroot_tree_endpoint(job_id):
     target = data.get("root_target") or data.get("target") or data.get("node_name")
 
     if not target:
+        note_request_failure("reroot_target_missing")
         return jsonify({"status": "error", "error": "Missing root_target"}), 400
-    
+
     try:
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
@@ -3738,6 +3988,7 @@ def reroot_tree_endpoint(job_id):
                 checkpoint.commit()
         return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
+        note_request_failure(getattr(e, "failure_code", None) or "reroot_refused")
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
@@ -3959,6 +4210,12 @@ def save_clade_annotations(job_id):
             apply_annotation_config,
             normalize_annotation_config,
         )
+        from app.services.tree_undo_service import (
+            ANNOTATION_COALESCING_KINDS,
+            ANNOTATION_UNDO_DEFAULT_LABEL,
+            ANNOTATION_UNDO_LABELS,
+            extend_undo_checkpoint,
+        )
 
         with tree_state_lock(job_dir):
             # Load and commit under the same per-job lock. This preserves a
@@ -3972,16 +4229,45 @@ def save_clade_annotations(job_id):
                 # configuration is still intact on disk.
                 return jsonify({"status": "error", "error": str(exc)}), 400
 
-            apply_annotation_config(state, config)
-            save_tree_state(job_dir, state)
-            # Annotations are deliberate authoring work and are not undoable.
-            # An undo checkpoint older than this save would roll them back with
-            # the edit it does undo, so drop it rather than offer that.
-            clear_undo_checkpoint(job_dir)
+            before = (
+                state.get(ANNOTATION_LAYERS_KEY) or [],
+                state.get(CLADE_ANNOTATIONS_KEY) or [],
+            )
+            changed = before != (
+                config[ANNOTATION_LAYERS_KEY], config[CLADE_ANNOTATIONS_KEY],
+            )
+            # The client names only a kind; the label always comes from the
+            # server's own table, so annotation text never becomes a label.
+            undo_kind = data.get("undo_kind")
+            if not isinstance(undo_kind, str) or undo_kind not in ANNOTATION_UNDO_LABELS:
+                undo_kind = None
+            undo_label = ANNOTATION_UNDO_LABELS.get(undo_kind, ANNOTATION_UNDO_DEFAULT_LABEL)
+            coalesce_key = undo_kind if undo_kind in ANNOTATION_COALESCING_KINDS else None
+
+            if not changed:
+                # A no-op save must not replace a real checkpoint with an
+                # empty one.
+                apply_annotation_config(state, config)
+                save_tree_state(job_dir, state)
+            elif coalesce_key and extend_undo_checkpoint(
+                job_dir, "annotation", coalesce_key, undo_label
+            ):
+                # Continues a debounced burst (one colour drag): keep the
+                # snapshot from before the burst began.
+                apply_annotation_config(state, config)
+                save_tree_state(job_dir, state)
+            else:
+                with undo_checkpoint(job_dir, "annotation", undo_label) as checkpoint:
+                    apply_annotation_config(state, config)
+                    save_tree_state(job_dir, state)
+                    checkpoint.commit(coalesce_key=coalesce_key)
+            undo_state = describe_undo_checkpoint(job_dir)
         return jsonify({
             "status": "ok",
             "layers": config[ANNOTATION_LAYERS_KEY],
             "annotations": config[CLADE_ANNOTATIONS_KEY],
+            "undo": undo_state,
+            "undo_recorded": changed,
         })
     except Exception as e:
         return _server_error(e, where="save_clade_annotations")
@@ -4357,6 +4643,13 @@ def get_job_pipeline_params(job_id):
             and "mcmc_stop_early" not in stored):
         params["mcmc_stop_early"] = False
 
+    if str(stored.get("tree_method", "")).lower() == "raxml":
+        from app.services.raxml_validator import stored_bootstrap_cutoff
+
+        params["bootstrap_cutoff"] = stored_bootstrap_cutoff(
+            stored, Config.JOB_DIR / job_id
+        )
+
     # The requested model is often not the one that was fit -- IQ-TREE's "MFP"
     # defers to ModelFinder, and RAxML with MOOSE enabled substitutes its own
     # pick. Report the fitted model, and who chose it, rather than leaving the
@@ -4728,17 +5021,36 @@ def _mrbayes_name_map_text(job_dir):
                 "taxa but the run declares %d", job_dir.name, len(rows), declared,
             )
 
-    return format_name_map(reconstructed) if reconstructed else None
+    if not reconstructed:
+        return None
+    text = format_name_map(reconstructed)
+    if declared is not None and len(reconstructed) != declared:
+        # Still the best key there is, and the labels must not leave without
+        # one -- but say plainly that it does not match the run.
+        logger.warning(
+            "Serving an unverified MrBayes name map for %s: %d records against "
+            "%d declared taxa", job_dir.name, len(reconstructed), declared,
+        )
+        text = (
+            "# WARNING: this key could not be verified. The MrBayes run declares "
+            f"{declared} taxa, but the alignment it was rebuilt from has "
+            f"{len(reconstructed)} records, so ids after the first difference "
+            "may name the wrong sequence.\n" + text
+        )
+    return text
 
 
 def _reconstructed_mrbayes_name_map(job_dir, declared):
     """Rebuild the key from the alignment this generation of the run consumed.
 
     Returns ``(mapping, confirmed)``. `confirmed` means the alignment holds
-    exactly the number of taxa the run declares, which is what licenses using
-    it to overrule a stored map.
+    exactly the number of taxa the run declares after excluding the identical
+    sequences that its metadata says were left out of the search. Only this
+    generation's alignments can overrule a stored map.
     """
-    from app.services.artifact_storage import artifact_exists
+    import json
+
+    from app.services.artifact_storage import artifact_exists, open_artifact
     from app.services.fasta_utils import reconstruct_name_map
 
     # A recompute rebuilds the tree from its own realigned, pruned alignment,
@@ -4757,17 +5069,37 @@ def _reconstructed_mrbayes_name_map(job_dir, declared):
             job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
             job_dir / "alignment" / "alignment_pruned_aligned.fasta",
         ]
-    candidates += [
-        job_dir / "alignment" / "alignment_trimmed.fasta",
-        job_dir / "alignment" / "alignment_raw.fasta",
-    ]
+    else:
+        candidates += [
+            job_dir / "alignment" / "alignment_trimmed.fasta",
+            job_dir / "alignment" / "alignment_raw.fasta",
+        ]
+
+    metadata_path = tree_dir / (
+        "tree_pruned_metadata.json" if recomputed else "tree_metadata.json"
+    )
+    excluded_headers = set()
+    if artifact_exists(metadata_path):
+        try:
+            with open_artifact(metadata_path, "rt") as handle:
+                metadata = json.load(handle)
+            collapse = metadata.get("identical_sequences") if isinstance(metadata, dict) else None
+            if isinstance(collapse, dict):
+                excluded_headers = {
+                    name for group in collapse.get("groups") or []
+                    if isinstance(group, dict)
+                    for name in group.get("removed") or []
+                    if isinstance(name, str)
+                }
+        except (OSError, ValueError):
+            logger.warning("Could not read MrBayes collapse metadata from %s", metadata_path)
 
     fallback = None
     for path in candidates:
         if not artifact_exists(path):
             continue
         try:
-            mapping = reconstruct_name_map(path)
+            mapping = reconstruct_name_map(path, excluded_headers=excluded_headers)
         except Exception:
             logger.warning("Could not reconstruct a MrBayes name map from %s", path)
             continue
@@ -4778,6 +5110,9 @@ def _reconstructed_mrbayes_name_map(job_dir, declared):
         if fallback is None:
             fallback = mapping
 
+    # Unconfirmed: either the run declares no count, or no alignment of this
+    # generation matches it. The caller labels the latter as unverified rather
+    # than dropping the key (a stored map that does match is preferred).
     return fallback, False
 
 
@@ -4837,6 +5172,16 @@ def download_mrbayes_files(job_id):
         name_map = _mrbayes_name_map_text(job_dir)
         if name_map:
             zip_file.writestr(NAME_MAP_FILENAME, name_map)
+        else:
+            # Never drop the labels silently: say why the key is missing.
+            zip_file.writestr(
+                "sequence_names_unavailable.txt",
+                "The taxa in these MrBayes files are SEQnnnnnn ids. The key that "
+                "maps them back to sequence names could not be rebuilt for this "
+                "job, because neither a stored key nor the alignment this run was "
+                "built from is available. The Newick and NEXUS tree downloads "
+                "carry the real names.\n",
+            )
     archive.seek(0)
 
     response = send_file(
@@ -6122,7 +6467,10 @@ def log_client_error():
     # Link-load events from preview crawlers and hidden tabs are common and
     # rarely signal a broken page for an active visitor. Retain them in the
     # web log, but keep the WARNING+ mirror focused on actionable failures.
-    log_event = current_app.logger.info if (
+    third_party = (event in {"window_error", "unhandled_rejection"}
+                   and "iabjs://" in stack and "postMessage" in message
+                   and "FB_IAB/" in browser_agent)
+    log_event = current_app.logger.info if third_party or (
         event == "resource_load_failed" and (
             visibility in {"hidden", "prerender"} or "meta-externalagent/" in browser_agent.lower()
         )
@@ -6131,11 +6479,12 @@ def log_client_error():
         "event=client.%s Browser failure pathname=%s job_id=%s action=%s "
         "message=%s fingerprint=%s release=%s client_release=%s "
         "server_request_id=%s method=%s http_status=%s duration_ms=%s "
-        "online=%s visibility=%s browser=%s stack=%s",
+        "online=%s visibility=%s origin=%s client=%s browser=%s stack=%s",
         event, pathname, job_id or "-", action or "-", message, fingerprint,
         current_app.config.get("RELEASE_VERSION", "unknown"),
         client_release, server_request_id, method, http_status,
         bounded_integer("duration_ms", 3_600_000), online, visibility,
+        "facebook_injected" if third_party else "browser", _client_log_value(request.remote_addr, 64) or "-",
         browser_agent, stack or "-",
     )
     return jsonify({"status": "logged"}), 200
@@ -6158,7 +6507,8 @@ def add_sequences_to_job(job_id):
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
     data = request.get_json(silent=True) or {}
-    input_text = data.get("input", "").strip()
+    raw_input_text = data.get("input", "")
+    input_text = raw_input_text.strip()
     replace_existing = bool(data.get("replace"))
     
     if not input_text:
@@ -6177,7 +6527,8 @@ def add_sequences_to_job(job_id):
         
         # Heuristic: Check if input looks like a list of accessions (no > at start, short lines)
         first_line = input_text.splitlines()[0].strip()
-        if not first_line.startswith(">"):
+        if not (first_line.startswith((">", "\ufeff>")) or
+                any(line.lstrip().startswith(">") for line in input_text.splitlines())):
             # Assume accessions
             is_accession_input = True
             
@@ -6205,6 +6556,15 @@ def add_sequences_to_job(job_id):
                 )
         else:
             # Assume FASTA
+            from app.services.fasta_utils import FastaValidationError
+            from app.services.fasta_input_service import validate_submitted_fasta
+            try:
+                validate_submitted_fasta(raw_input_text, source="existing_job_addition")
+            except FastaValidationError as exc:
+                note_request_failure("invalid_dna_fasta")
+                return jsonify({"status": "error", "error": str(exc),
+                                "fasta_validation": exc.analysis,
+                                "diagnostic_id": exc.diagnostic_id}), 400
             sequences_to_add = _parse_fasta_sequences(input_text)
             # Pasted MycoMap/NCBI headers carry the whole GenBank definition
             # line. /api/mycomap compacts those before they reach the queue;
@@ -6237,14 +6597,20 @@ def add_sequences_to_job(job_id):
             return jsonify({"status": "error", "error": str(exc)}), 400
 
         # 2. Sequence Count Limit
+        # Alan 11/1/26 - These two caps bound one APPEND. A replace is the Tree
+        # Builder's "Add & Recompute", which posts the whole queue as the job's
+        # new input, so capping it at 500 made every job over 500 sequences
+        # uneditable (gx1e and e0nz, 830 and 526 records, refused four times on
+        # 2026-10-30). A replace is the same size question as creating the job,
+        # and the shared creation ceilings were already applied just above.
         MAX_SEQUENCES_TO_ADD = 500
-        if len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
+        if not replace_existing and len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
             return jsonify({"status": "error", "error": f"Too many sequences (max {MAX_SEQUENCES_TO_ADD})"}), 400
-            
+
         # 3. Total Base Pair Limit
         MAX_TOTAL_BP_TO_ADD = 2_000_000
         total_bp = sum(len(s['sequence']) for s in sequences_to_add)
-        if total_bp > MAX_TOTAL_BP_TO_ADD:
+        if not replace_existing and total_bp > MAX_TOTAL_BP_TO_ADD:
              return jsonify({"status": "error", "error": f"Total sequence length too large (max {MAX_TOTAL_BP_TO_ADD} bp)"}), 400
              
         # Append to input_raw.fasta, or replace it when the queue is the desired final set.

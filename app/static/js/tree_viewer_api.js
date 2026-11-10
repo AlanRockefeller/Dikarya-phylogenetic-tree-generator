@@ -212,12 +212,16 @@ const TreeEditActions = {
     // Alan 8/15/26 - Save the whole layered clade-annotation configuration in one
     // atomic request. Partial saves would let a rejected layer strand the
     // annotations that reference it, so layers and annotations always travel together.
-    async saveCladeAnnotations(jobId, layers, annotations) {
+    // `undoKind` names what the edit was so the server can label its Undo checkpoint;
+    // the server picks the label text itself and ignores a kind it does not know.
+    async saveCladeAnnotations(jobId, layers, annotations, undoKind = null) {
+        const body = { layers: layers, annotations: annotations };
+        if (undoKind) body.undo_kind = undoKind;
         const response = await fetch(`/api/job/${jobId}/tree/annotations`, {
             method: 'POST',
             headers: this._buildHeaders(),
             credentials: "same-origin",
-            body: JSON.stringify({ layers: layers, annotations: annotations })
+            body: JSON.stringify(body)
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {

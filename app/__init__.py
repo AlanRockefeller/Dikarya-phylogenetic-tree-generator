@@ -13,6 +13,24 @@ SCANNER_404_LIMIT = 60
 SCANNER_404_WINDOW_SECONDS = 60
 
 
+def _redirect_mistyped_job_id():
+    """Redirect safe GET/HEAD job links containing a typographic multiply sign."""
+    from flask import redirect, request, url_for
+    from app.services.security_utils import repair_job_id_multiplication_sign
+
+    if request.method not in {"GET", "HEAD"} or not request.endpoint:
+        return None
+    view_args = dict(request.view_args or {})
+    repaired = repair_job_id_multiplication_sign(view_args.get("job_id"))
+    if repaired is None:
+        return None
+    view_args["job_id"] = repaired
+    target = url_for(request.endpoint, **view_args)
+    if request.query_string:
+        target = f"{target}?{request.query_string.decode('latin-1')}"
+    return redirect(target, code=308)
+
+
 def _scanner_404_redis():
     """Return the short-timeout Redis client used by the missing-route gate."""
     import redis
@@ -248,6 +266,10 @@ def create_app(config_name='default'):
 
     # Alan 8/14/26 - Request-scoped log context + an errors-only log file.
     _install_logging(app, under_gunicorn=under_gunicorn)
+    # Alan 10/17/26 - Some rich-text clients turn the `x` in a short job ID
+    # into ×. Redirect read-only links to the canonical path only if replacing
+    # that character produces a fully valid ID; mutation requests stay strict.
+    app.before_request(_redirect_mistyped_job_id)
     app.logger.info(
         "event=application.start release=%s config=%s",
         app.config.get("RELEASE_VERSION", "unknown"), config_name,

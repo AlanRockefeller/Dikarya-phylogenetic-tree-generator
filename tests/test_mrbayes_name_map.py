@@ -6,6 +6,7 @@ sequence shifts every later one -- so a map or an alignment from the wrong
 generation decodes the run to the wrong sequences.
 """
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -62,6 +63,60 @@ class MrBayesNameMapTests(unittest.TestCase):
         self.assertIn("SEQ000001\tAmanita pantherina two", text)
         self.assertIn("SEQ000002\tRussula emetica three", text)
         self.assertNotIn("Amanita muscaria one", text)
+
+    def test_collapsed_recompute_uses_current_names_when_old_taxon_count_matches(self):
+        from app.services.fasta_utils import sanitize_fasta_headers, write_name_map
+        from app.services.identical_sequences import plan_identical_collapse
+
+        job_dir = Path(self.root) / "collapsed"
+        original = ORIGINAL + [("D", "ACGTACGG"), ("E", "ACGTACCC")]
+        current = original[1:] + [("F", "ACGTACCA"), ("F twin", "ACGTACCA")]
+        write_fasta(job_dir / "alignment" / "alignment_trimmed.fasta", original)
+        alignment = job_dir / "alignment" / "alignment_pruned_trimmed.fasta"
+        write_fasta(alignment, current)
+        tree_dir = job_dir / "tree"
+        tree_dir.mkdir()
+        collapse = plan_identical_collapse(alignment, tree_dir)
+        self.assertIsNotNone(collapse)
+        mapping = sanitize_fasta_headers(collapse.reduced_fasta, tree_dir / "sanitized.fasta")
+        write_name_map(mapping, tree_dir / NAME_MAP_FILENAME)
+        stored = (tree_dir / NAME_MAP_FILENAME).read_text()
+        write_nexus(tree_dir / "mrbayes_input.nex", len(mapping))
+        (tree_dir / "tree_pruned.newick").write_text("(B,C,D,E,F);")
+        (tree_dir / "tree_pruned_metadata.json").write_text(json.dumps({
+            "identical_sequences": collapse.metadata(),
+        }))
+
+        self.assertEqual(self.resolve(job_dir), stored)
+        # The run's metadata can also rebuild a missing or stale decoder.
+        (tree_dir / NAME_MAP_FILENAME).unlink()
+        self.assertEqual(self.resolve(job_dir), stored)
+
+    def test_missing_recompute_alignments_do_not_confirm_an_original_generation_map(self):
+        job_dir = recomputed_job(self.root)
+        stored = "SEQ000001\tCurrent one\nSEQ000002\tCurrent two\nSEQ000003\tCurrent three\n"
+        write_nexus(job_dir / "tree" / "mrbayes_input.nex", len(ORIGINAL))
+        (job_dir / "tree" / NAME_MAP_FILENAME).write_text(stored)
+        for name in ("alignment_pruned_trimmed.fasta", "alignment_pruned_aligned.fasta"):
+            (job_dir / "alignment" / name).unlink()
+
+        self.assertEqual(self.resolve(job_dir), stored)
+
+    def test_original_collapsed_run_is_reconstructed_from_its_kept_records(self):
+        job_dir = Path(self.root) / "original-collapsed"
+        current = ORIGINAL + [("D", "ACGTACGG"), ("twin of first", ORIGINAL[0][1])]
+        write_fasta(job_dir / "alignment" / "alignment_trimmed.fasta", current)
+        write_nexus(job_dir / "tree" / "mrbayes_input.nex", 4)
+        (job_dir / "tree" / "tree_metadata.json").write_text(json.dumps({
+            "identical_sequences": {
+                "groups": [{"kept": ORIGINAL[0][0], "removed": ["twin of first"]}],
+            },
+        }))
+
+        text = self.resolve(job_dir)
+        self.assertIn("SEQ000001\tAmanita muscaria one", text)
+        self.assertIn("SEQ000004\tD", text)
+        self.assertNotIn("twin of first", text)
 
     def test_a_stale_map_from_the_previous_generation_is_not_used(self):
         stale = (

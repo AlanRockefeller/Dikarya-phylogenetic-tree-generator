@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Amanitaceae archive</title>
+<style>body{font:1rem/1.6 system-ui;margin:4rem auto;max-width:40rem;padding:0 1rem;color:#1a2f23;background:#f8f6f0}a{color:inherit}@media(prefers-color-scheme:dark){body{color:#ece4cf;background:#14241b}}</style>
+<p>This archive page has moved. <a id="archive-destination" href="/amanitaceae/">Continue to the Amanitaceae archive</a>.</p>
+<script>
+(() => {
+    // Fixed destinations only; old queries must never become an open redirect.
+    const sections = {
+        phalloideae: 'section-phalloideae', validae: 'section-validae',
+        amanita: 'section-amanita', vaginatae: 'section-vaginatae',
+        caesareae: 'section-caesareae', lepidella: 'section-lepidella',
+        amidella: 'section-amidella'
+    };
+    let query = '';
+    try { query = decodeURIComponent(location.search.slice(1).replace(/\+/g, ' ')).trim(); } catch (_) {}
+    const match = /^section\s+([a-z]+)$/i.exec(query);
+    const slug = match && sections[match[1].toLowerCase()];
+    const destination = slug ? `/amanitaceae/pages/${slug}/` : '/amanitaceae/';
+    document.getElementById('archive-destination').href = destination;
+    location.replace(destination);
+})();
+</script>
+</html>

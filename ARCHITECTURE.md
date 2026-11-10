@@ -225,7 +225,8 @@ one-entry record of the clades a collapse/expand changed and restores it
 locally. Nothing reaches the server, and collapse is deliberately **not**
 persisted — a reload shows the whole tree again.
 
-**Persisted.** Prune, rename, rotate and every rooting change are undone by
+**Persisted.** Prune, rename, rotate, every rooting change and annotation
+edits are undone by
 restoring a file snapshot taken immediately before them. Those operations write
 exactly three files:
 
@@ -255,8 +256,18 @@ Rules the implementation depends on:
   useful checkpoint alone.
 - Undo restores the whole snapshot, so any operation that writes tree state and is
   *not* undoable must call `clear_undo_checkpoint()` rather than let a later Undo
-  silently revert it. Annotations, the MycoMap label refresh, the focal sequence,
-  every `/api/v1` tree mutation and recompute all do.
+  silently revert it. The MycoMap label refresh, the focal sequence, every
+  `/api/v1` tree mutation and recompute all do.
+- **Annotation saves are undoable** (since 2026-10-20; they used to clear the
+  checkpoint). The viewer sends an `undo_kind` (`add`, `delete`, `members`,
+  `layer_order`, ...) and the server picks the label from
+  `ANNOTATION_UNDO_LABELS`, so annotation text never becomes a label. A save
+  that changes nothing keeps the earlier checkpoint. The debounced kinds
+  (`layer_style`, `layer_rename`) coalesce: a save of the same kind within
+  `COALESCE_WINDOW_SECONDS` of the previous one extends the checkpoint rather
+  than replacing it, so one colour-picker drag undoes as a unit. The viewer
+  flushes a pending or in-flight annotation save before applying Undo, so a
+  late save cannot re-apply what was just undone.
   `/tree/selection_sets` deliberately does not: the viewer saves selections
   automatically right after every prune, so clearing there would disable Undo the
   instant it became useful.

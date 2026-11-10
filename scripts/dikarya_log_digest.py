@@ -7,6 +7,7 @@ import gzip
 import json
 import math
 import re
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,13 +18,14 @@ DEFAULT_CHECKPOINT = REPO_ROOT / ".log-review-checkpoint.json"
 ACCESS_RE = re.compile(
     r'^(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
     r'"(?P<method>[A-Z]+) (?P<path>\S+) (?P<proto>[^"]+)" '
-    r'(?P<status>\d{3}) (?P<size>\S+) "(?P<ref>[^"]*)" "(?P<ua>[^"]*)"'
-    r'(?: (?P<micros>\d+))?(?: req=(?P<req>\S+))?(?: noise=(?P<noise>\S+))?'
+    r'(?P<status>\d{3}) (?P<size>\S+) "(?P<ref>(?:\\.|[^"\\])*)" "(?P<ua>(?:\\.|[^"\\])*)"'
+    r'(?: (?P<micros>\d+))?(?: req=(?P<req>\S+))?(?: noise=(?P<noise>\S+))?\s*$'
 )
 UUID_RE = re.compile(r'(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 NUMERIC_SEG_RE = re.compile(r'/\d+(?=/|$|\.)')
 TS_RE = re.compile(r'^\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})')
 LEVEL_RE = re.compile(r'\[(ERROR|CRITICAL|WARNING)\]')
+LEVEL_PRIORITY = {"WARNING": 1, "ERROR": 2, "CRITICAL": 3}
 CONTEXT_RE = re.compile(r'\[(?=[^\]]*\b(?:req|job|rq|user)=)(?P<body>[^\]]+)\]')
 # The WARNING+ mirror's timestamp has milliseconds and is followed by a logger
 # name. Gunicorn's copy instead has a numeric UTC offset and no logger field.
@@ -93,6 +95,10 @@ def log_files(stem, cutoff=None):
 
 def normalize_path(path):
     path = path.split("?", 1)[0]
+    # Only replace ids in known positions; ordinary words and arbitrary scanner
+    # paths must not accidentally become job identifiers.
+    path = re.sub(r'(/(?:api/(?:v1/jobs|job)|job)/)[^/]+', r'\1<id>', path)
+    path = re.sub(r'(/api/background/)[^/]+', r'\1<task_id>', path)
     path = UUID_RE.sub("<id>", path)
     path = NUMERIC_SEG_RE.sub("/<id>", path)
     return path
@@ -283,6 +289,7 @@ def analyze_access(cutoff, until=None):
     streams = collections.defaultdict(list)
     clients = collections.Counter()
     agents = collections.Counter()
+    noise_requests = set()
     oldest = newest = None
     lines = unparsed = timed = contextual = total = 0
     for path in files:
@@ -315,6 +322,8 @@ def analyze_access(cutoff, until=None):
                         normalized, match.group("ua"), status, match.group("method")
                     ) else product_4xx
                     target[(status, endpoint)] += 1
+                    if match.group('noise') == 'scanner' and match.group("req") not in (None, "-", ""):
+                        noise_requests.add(match.group("req"))
                 if status == 429:
                     rate_limited[match.group("ip")] += 1
                 micros = match.group("micros")
@@ -328,7 +337,7 @@ def analyze_access(cutoff, until=None):
         "total": total, "statuses": statuses, "server_errors": server_errors,
         "product_4xx": product_4xx, "noise_4xx": noise_4xx,
         "rate_limited": rate_limited, "durations": durations, "streams": streams,
-        "clients": clients, "agents": agents,
+        "clients": clients, "agents": agents, "noise_requests": noise_requests,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, timed, contextual, total),
     }
 
@@ -368,6 +377,14 @@ def meaningful_error_key(record):
     first = lines[0] if lines else record
     message = formatted_log_message(first)
     message = UUID_RE.sub("<id>", message)
+    if "event=client." in message:
+        # Fingerprints identify individual reports, not distinct bugs. Keeping
+        # them (and short job IDs) split one fetch failure across dozens of
+        # rows, burying the other warnings in a supposedly grouped digest.
+        message = message.split(" fingerprint=", 1)[0]
+        message = re.sub(r'\bjob_id=\S+\s*', '', message)
+        message = re.sub(r'(/(?:api/)?job/)[a-z0-9]{4,12}(?=/|\s|$)',
+                         r'\1<id>', message)
     message = re.sub(r'\bdiagnostic=[0-9a-f]{32}\b', 'diagnostic=<id>', message)
     message = re.sub(r'\b\d+\b', '<n>', message)
     return message.strip()[:180]
@@ -423,9 +440,30 @@ ACTOR_RE = re.compile(
 SSE_CLOSED_RE = re.compile(
     r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
 )
+# Alan 11/8/26 - Registrations are INFO, so no section ever showed them, and a
+# signup bot's account (a "dotted" Gmail address) went unnoticed for days.
+# Collected before the WARNING+ filter, like sse.closed.
+REGISTERED_RE = re.compile(
+    r'event=auth\.registered\s+account_id=(?P<account>\d+)\s+email=(?P<email>\S+)'
+)
+# A request the access log marked noise=scanner keeps its ordinary
+# http.request_failed line (security records only ever add to the diagnostics),
+# so for a 4xx the exceptions section drops that row instead of listing the
+# same scanner request a second time.
+HTTP_FAILED_RE = re.compile(r'event=http\.request_failed\b.*?\bstatus=(?P<status>\d+)')
 
 
-def analyze_errors(cutoff, until=None):
+def signup_hint(email):
+    """A note for a registration whose address looks machine-made, or ''."""
+    local, _, domain = str(email or "").lower().rpartition("@")
+    # Gmail ignores dots, so "j.o.h.n.d.o.e.4.2" lands in one inbox under any
+    # number of spellings; three or more dots is rare for a person.
+    if domain in ("gmail.com", "googlemail.com") and local.count(".") >= 3:
+        return "dotted Gmail address, a common signup-bot pattern"
+    return ""
+
+
+def analyze_errors(cutoff, until=None, noise_requests=None):
     # Grouped by stem rather than flattened into one list, because the
     # occurrence counter below has to reset between the two mirrored streams
     # while still counting across each stream's own rotations.
@@ -440,6 +478,7 @@ def analyze_errors(cutoff, until=None):
     streams = [log_files("error", cutoff), log_files("errors", cutoff)]
     files = [path for stream in streams for path in stream]
     exceptions = collections.Counter()
+    exception_levels = {}
     degradations = collections.Counter()
     # Alan 9/12/26 - Probes aimed at this application, and SSE stream lifetimes
     # taken from the app's own close event rather than inferred from access-log
@@ -450,6 +489,8 @@ def analyze_errors(cutoff, until=None):
     security_clients = collections.defaultdict(set)
     actors = {}
     sse_closes = collections.defaultdict(list)
+    registrations = []
+    noise_failures = 0
     affected = collections.defaultdict(set)
     affected_jobs = collections.defaultdict(set)
     seen = set()
@@ -479,6 +520,13 @@ def analyze_errors(cutoff, until=None):
                 if sse_close:
                     sse_closes[sse_close.group("reason")].append(
                         float(sse_close.group("seconds"))
+                    )
+                # INFO and app-logger only, so like sse.closed it appears in
+                # error.log alone and cannot be double-counted by the mirror.
+                registered = REGISTERED_RE.search(record.splitlines()[0])
+                if registered:
+                    registrations.append(
+                        (when, int(registered.group("account")), registered.group("email"))
                     )
                 if not LEVEL_RE.search(record.splitlines()[0]):
                     continue
@@ -510,6 +558,11 @@ def analyze_errors(cutoff, until=None):
                 if incident in seen:
                     continue
                 seen.add(incident)
+                if noise_requests and request in noise_requests:
+                    failed_request = HTTP_FAILED_RE.search(record.splitlines()[0])
+                    if failed_request and int(failed_request.group("status")) < 500:
+                        noise_failures += 1
+                        continue
                 if fields:
                     contextual += 1
                 user = fields.get("user")
@@ -559,15 +612,22 @@ def analyze_errors(cutoff, until=None):
                         affected_jobs[slug[:100]].add(job)
                 else:
                     exceptions[key] += 1
+                    level_match = LEVEL_RE.search(first_line)
+                    level = level_match.group(1) if level_match else "WARNING"
+                    previous_level = exception_levels.get(key, "WARNING")
+                    if LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[previous_level]:
+                        exception_levels[key] = level
                     if user:
                         affected[key].add(user)
                     if job:
                         affected_jobs[key].add(job)
     return {
-        "exceptions": exceptions, "degradations": degradations, "affected": affected,
+        "exceptions": exceptions, "exception_levels": exception_levels,
+        "degradations": degradations, "affected": affected,
         "affected_jobs": affected_jobs, "security": security,
         "security_clients": security_clients, "sse_closes": sse_closes,
-        "actors": actors,
+        "actors": actors, "registrations": registrations,
+        "noise_failures": noise_failures,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, len(seen)),
     }
 
@@ -965,9 +1025,10 @@ def analyze_type_specimens(cutoff, until, path=REFRESH_LOG_PATH):
             if not (cutoff <= when < until):
                 continue
             if name == "refresh_started":
-                run = {"started": when, "mycomap": None, "genbank": None, "finished": None}
+                run = {"started": when, "mycomap": None, "genbank": None, "curation": None,
+                       "finished": None}
                 result["runs"].append(run)
-            elif name in ("mycomap_summary", "genbank_summary") and run is not None:
+            elif name in ("mycomap_summary", "genbank_summary", "curation_summary") and run is not None:
                 run[name.split("_")[0]] = fields
             elif name == "refresh_finished" and run is not None:
                 run["finished"] = fields
@@ -983,11 +1044,15 @@ def _type_row(fields, sign):
             f"{fields.get('organism') or '(organism not given)'}")
     if fields.get("voucher"):
         text += f"  voucher={fields['voucher']}"
-    text += f"  [{fields.get('source', '?')}]"
+    text += f"  [{fields.get('source', '?')}"
+    text += f" basis={fields['basis']}]" if fields.get("basis") else "]"
+    # A curation flag can overlap either other source; the list's own events
+    # are only ever compared with GenBank.
+    other = "another source" if fields.get("source") == "mycomap_curation" else "GenBank"
     if fields.get("previously_marked") == "yes":
-        text += " (already marked from GenBank)"
+        text += f" (already marked from {other})"
     if fields.get("still_marked") == "yes":
-        text += " (still marked from GenBank)"
+        text += f" (still marked from {other})"
     if sign == "~":
         text += f" was {fields.get('previous_status') or '-'}"
     return text
@@ -1002,6 +1067,7 @@ def print_type_specimens(data, until, limit=200):
     for run in data["runs"]:
         finished = run["finished"] or {}
         mycomap, genbank = run["mycomap"] or {}, run["genbank"] or {}
+        curation = run.get("curation") or {}
         parts = [f"{run['started']:%Y-%m-%d %H:%M}",
                  finished.get("outcome", "UNFINISHED (killed or still running)")]
         if finished:
@@ -1014,6 +1080,11 @@ def print_type_specimens(data, until, limit=200):
             parts.append(f"genbank: +{genbank.get('added')} of {genbank.get('checked')} checked, "
                          f"{genbank.get('missing')} missing, {genbank.get('unanswered')} unanswered, "
                          f"{genbank.get('deferred')} left for next run")
+        if curation:
+            parts.append(f"curation: +{curation.get('added')} -{curation.get('removed')} "
+                         f"of {curation.get('checked')} checked, "
+                         f"{curation.get('unanswered')} unanswered, "
+                         f"{curation.get('deferred')} left for next run")
         print("  " + "  |  ".join(parts))
     if not data["runs"]:
         last = data["last_run"]
@@ -1029,7 +1100,7 @@ def print_type_specimens(data, until, limit=200):
     # Every added type is listed: this is the part a reviewer reports.
     for key, sign, title in (("added", "+", "New type sequences"),
                              ("reclassified", "~", "Type status changed"),
-                             ("removed", "-", "No longer on MycoMap's list")):
+                             ("removed", "-", "No longer a MycoMap type")):
         items = data[key]
         if not items:
             continue
@@ -1057,6 +1128,37 @@ def rows(items, empty="  (none)"):
             print(f"  {item}")
 
 
+def format_exception_rows(errors):
+    """Render every grouped WARNING+ finding, with serious levels first.
+
+    These groups are already compacted by ``meaningful_error_key``. Truncating
+    them to ``--top`` silently hid low-frequency ERRORs and tied warnings behind
+    whichever message happened to be inserted first, so this safety-critical
+    section deliberately does not use the general top-N display limit.
+    """
+    levels = errors.get("exception_levels", {})
+    ranked = sorted(
+        errors["exceptions"].items(),
+        key=lambda item: (
+            -LEVEL_PRIORITY.get(levels.get(item[0], "WARNING"), 1),
+            -item[1],
+            item[0],
+        ),
+    )
+    return [
+        f"{count:>5}  [{levels.get(key, 'WARNING')}] {key}"
+        + (
+            f" [jobs: {len(errors['affected_jobs'][key])}]"
+            if errors["affected_jobs"].get(key) else ""
+        )
+        + (
+            f" [users: {', '.join(sorted(errors['affected'][key])[:3])}]"
+            if errors["affected"].get(key) else ""
+        )
+        for key, count in ranked
+    ]
+
+
 def format_coverage(label, data):
     oldest = data["oldest"].strftime("%Y-%m-%d %H:%M:%S") if data["oldest"] else "-"
     newest = data["newest"].strftime("%Y-%m-%d %H:%M:%S") if data["newest"] else "-"
@@ -1067,6 +1169,203 @@ def format_coverage(label, data):
     return (f"{label}: files={','.join(data['files']) or '-'} range={oldest}..{newest} "
             f"scanned={data['lines']} in-window={data['observed']} unparsed={data['unparsed']} "
             f"timing={timing:.1f}% context={context:.1f}%")
+
+
+def analyze_operations(cutoff, until):
+    """INFO outcomes that HTTP status and the warning mirror cannot describe."""
+    assets = collections.defaultdict(lambda: {"count": 0, "clients": set(), "visibility": collections.Counter()})
+    background = collections.defaultdict(list)
+    imports = collections.defaultdict(collections.Counter)
+    third_party = collections.Counter()
+    seen = set()
+    for stem in ("error", *WORKER_STEMS):
+        for path in log_files(stem, cutoff):
+            for record in iter_log_records(path):
+                when = parse_log_ts(record)
+                if when is None or not cutoff <= when < until:
+                    continue
+                line = record.splitlines()[0]
+                fields = context_fields(line)
+                identity = (when, fields.get("req"), fields.get("job"), record_identity(record))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if "event=client.resource_load_failed " in line:
+                    match = re.search(r'message=(.*?) fingerprint=', line)
+                    asset = normalize_path(match[1]) if match else "unknown"
+                    row = assets[asset]
+                    row["count"] += 1
+                    client = re.search(r'\bclient=(\S+)', line)
+                    user = fields.get("user")
+                    if user and user != "anon":
+                        row["clients"].add("user:" + user)
+                    elif client:
+                        row["clients"].add("client:" + client[1])
+                    visibility = re.search(r'\bvisibility=(\w+)', line)
+                    row["visibility"][visibility[1] if visibility else "unknown"] += 1
+                if "origin=facebook_injected " in line or ("iabjs://" in line and "postMessage" in line and "FB_IAB/" in line):
+                    third_party["facebook_injected"] += 1
+                if "event=background_request.completed " in line:
+                    kind = re.search(r'\bkind=(\w+)', line)
+                    status = re.search(r'\bstatus=(\d+)', line)
+                    duration = re.search(r'\bduration_ms=(\d+)', line)
+                    if kind and status and duration:
+                        background[(kind[1], int(status[1]))].append(int(duration[1]) / 1000)
+                if "event=import.source_summary " in line:
+                    operation = re.search(r'\boperation=(\w+)', line)
+                    source = re.search(r'\bsource=(\w+)', line)
+                    if operation and source:
+                        row = imports[(operation[1], source[1])]
+                        row["calls"] += 1
+                        values = dict(re.findall(r'\b(expected|fetched|omitted|unchecked|recovered)=(\d+)', line))
+                        for key, value in values.items():
+                            row[key] += int(value)
+                        row["partial"] += int(int(values.get("omitted", 0)) > 0)
+    return {"assets": assets, "background": background, "imports": imports, "third_party": third_party}
+
+
+NGINX_APP_ACCESS_RE = re.compile(
+    r' host="(?:www\.)?dikarya\.us" server="dikarya\.us"(?=\s|$)'
+)
+NGINX_ACCESS_TAIL_RE = re.compile(
+    r' host="(?:www\.)?dikarya\.us" server="dikarya\.us"'
+    r'(?:\s+[A-Za-z_][A-Za-z0-9_]*="(?:\\.|[^"\\])*")*\s*$'
+)
+NGINX_ACCESS_STALE_AFTER = timedelta(minutes=15)
+
+
+# The same layout with any quoted request field. A line that fits this but not
+# ACCESS_RE carries a request that is not an HTTP request line -- "-", TLS
+# bytes on the wrong port, a lowercase method -- which is client junk, not the
+# log_format drift the unparsed WARNING exists to catch.
+ACCESS_ANY_REQUEST_RE = re.compile(
+    r'^\S+ \S+ \S+ \[[^\]]+\] "(?:\\.|[^"\\])*" \d{3} \S+ '
+    r'"(?:\\.|[^"\\])*" "(?:\\.|[^"\\])*"(?: \d+)?(?: req=\S+)?(?: noise=\S+)?\s*$'
+)
+
+
+def parse_nginx_access(line):
+    """Accept old combined logs and the current timing/correlation suffix."""
+    tail = NGINX_ACCESS_TAIL_RE.search(line)
+    return ACCESS_RE.fullmatch(line[:tail.start()]) if tail else None
+
+
+def is_malformed_nginx_request(line):
+    """True for a well-formed log line whose client sent no valid request line."""
+    tail = NGINX_ACCESS_TAIL_RE.search(line)
+    return bool(tail and ACCESS_ANY_REQUEST_RE.fullmatch(line[:tail.start()]))
+
+
+def parse_nginx_access_ts(line):
+    stamp = re.search(r'\[([^\]]+)\]', line)
+    return parse_access_ts(stamp[1]) if stamp else None
+
+
+def analyze_nginx(cutoff, until):
+    """Use only the fixed read-only wrapper; never turn this into sudo cat."""
+    counts = collections.Counter()
+    coverage = []
+    for kind in ("access", "error"):
+        scoped = True
+        partial_fallback = False
+        try:
+            command = ["sudo", "-n", "/usr/local/sbin/dikarya-nginx-log", f"app-{kind}-all", "200000"]
+            result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=45)
+            if result.returncode == 2:
+                scoped = False
+                command = [*command[:-2], f"{kind}-all", command[-1]]
+                result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=45)
+            if result.returncode:
+                coverage.append(f"{kind}: unavailable (wrapper exit {result.returncode}); proxy/static failures are not covered")
+                continue
+            lines = result.stdout.splitlines()
+            if kind == "access":
+                lines = [line for line in lines if NGINX_APP_ACCESS_RE.search(line)]
+            if kind == "access" and scoped:
+                # An installed reader with the old end-of-line host filter
+                # returns only old rotations, successfully. An idle app looks
+                # the same, so preserve its scoped history and merge a bounded
+                # fallback only when it recovers newer Dikarya records.
+                timestamps = [parse_nginx_access_ts(line) for line in lines]
+                latest = max((when for when in timestamps if when is not None), default=None)
+                if latest is None or latest < until - NGINX_ACCESS_STALE_AFTER:
+                    fallback_command = [*command[:-2], "access-all", command[-1]]
+                    try:
+                        fallback = subprocess.run(fallback_command, capture_output=True, text=True, errors="replace", timeout=45)
+                    except (OSError, subprocess.TimeoutExpired):
+                        fallback = None
+                    if fallback is not None and fallback.returncode == 0:
+                        fallback_lines = [line for line in fallback.stdout.splitlines()
+                                          if NGINX_APP_ACCESS_RE.search(line)]
+                        fallback_times = [when for line in fallback_lines
+                                          if (when := parse_nginx_access_ts(line)) is not None]
+                        if fallback_times and (latest is None or max(fallback_times) > latest):
+                            scoped = False
+                            # An unfiltered tail can leave a gap after the
+                            # scoped history, even though their union is older
+                            # than the requested start boundary.
+                            partial_fallback = min(fallback_times) > max(cutoff, latest or cutoff)
+                            # Keep repeated requests within each source while
+                            # counting overlapping history only once.
+                            lines.extend((collections.Counter(fallback_lines)
+                                          - collections.Counter(lines)).elements())
+        except (OSError, subprocess.TimeoutExpired):
+            coverage.append(f"{kind}: unavailable; proxy/static failures are not covered")
+            continue
+        oldest = newest = None
+        observed = unparsed_app = malformed_requests = 0
+        for line in lines:
+            if kind == "access":
+                when = parse_nginx_access_ts(line)
+            else:
+                try:
+                    when = datetime.strptime(line[:19], "%Y/%m/%d %H:%M:%S")
+                except ValueError:
+                    when = None
+            if when is None:
+                continue
+            oldest = min(oldest, when) if oldest else when
+            newest = max(newest, when) if newest else when
+            if not cutoff <= when < until:
+                continue
+            if kind == "access":
+                match = parse_nginx_access(line)
+                if not match:
+                    if is_malformed_nginx_request(line):
+                        malformed_requests += 1
+                    else:
+                        unparsed_app += 1
+                    continue
+                observed += 1
+                status = int(match["status"])
+                if status >= 400:
+                    counts[(kind, str(status), match["method"] + " " + normalize_path(match["path"]))] += 1
+            else:
+                if "server: dikarya.us," not in line:
+                    continue
+                observed += 1
+                if "buffered to a temporary file" in line:
+                    continue
+                request_match = re.search(r'request: "([A-Z]+) (\S+) HTTP', line)
+                endpoint = request_match[1] + " " + normalize_path(request_match[2]) if request_match else "unknown"
+                reason = ("directory_forbidden" if "directory index" in line else
+                          "missing_static" if "No such file or directory" in line else
+                          "upstream_timeout" if "timed out" in line else "upstream_or_other")
+                counts[(kind, reason, endpoint)] += 1
+        boundary = f"{oldest}..{newest}" if oldest else "empty"
+        detail = f"{kind}: range={boundary} in-window-app={observed} scoped={'yes' if scoped else 'no'}"
+        if oldest is None or oldest > cutoff or partial_fallback:
+            detail += " WARNING partial historical coverage"
+        if kind == "access" and newest is not None and newest < until - NGINX_ACCESS_STALE_AFTER:
+            detail += " WARNING stale access history; recent proxy failures may be missing"
+        if malformed_requests:
+            detail += f" malformed_requests={malformed_requests}"
+        if unparsed_app:
+            detail += f" WARNING unparsed app access records={unparsed_app}"
+        if not scoped:
+            detail += " (install updated wrapper for filtering before the line limit)"
+        coverage.append(detail)
+    return counts, coverage
 
 
 def main():
@@ -1091,6 +1390,7 @@ def main():
     )
     parser.add_argument("--since-rotated", action="store_true", help="deprecated; rotations are always included")
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--skip-nginx", action="store_true", help="omit privileged read-only nginx log collection")
     parser.add_argument(
         "--type-specimen-log", type=Path, default=REFRESH_LOG_PATH,
         help=f"weekly type-specimen refresh log (default: {REFRESH_LOG_PATH})",
@@ -1139,7 +1439,7 @@ def main():
         parser.error("The review start must be earlier than --until")
 
     access = analyze_access(cutoff, until=until)
-    errors = analyze_errors(cutoff, until=until)
+    errors = analyze_errors(cutoff, until=until, noise_requests=access["noise_requests"])
     worker_details = {}
     worker_counts, unterminated, worker_coverage = analyze_worker(
         cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until,
@@ -1160,18 +1460,10 @@ def main():
     section("Crawler/scanner/static noise (4xx)")
     rows([f"{count:>5}  {status}  {endpoint}" for (status, endpoint), count in access["noise_4xx"].most_common(args.top)])
     section("Exceptions and errors")
-    rows([
-        f"{count:>5}  {key}"
-        + (
-            f" [jobs: {len(errors['affected_jobs'][key])}]"
-            if errors["affected_jobs"].get(key) else ""
-        )
-        + (
-            f" [users: {', '.join(sorted(errors['affected'][key])[:3])}]"
-            if errors['affected'].get(key) else ""
-        )
-        for key, count in errors["exceptions"].most_common(args.top)
-    ])
+    rows(format_exception_rows(errors))
+    if errors["noise_failures"]:
+        print(f"  ({errors['noise_failures']} 4xx request failure(s) on requests the app "
+              "classified as scanner traffic are counted in the noise section instead)")
     section("Degraded work")
     rows([f"{count:>5}  {key}" for key, count in errors["degradations"].most_common(args.top)])
     section("Worker lifecycle")
@@ -1198,6 +1490,30 @@ def main():
         for item in worker_details.get("failures", [])
     ])
     print_type_specimens(analyze_type_specimens(cutoff, until, args.type_specimen_log), until)
+    operations = analyze_operations(cutoff, until)
+    section("Background searches (whole operation, not poll latency)")
+    rows([f"{len(values):>5}  {kind} status={status} p50={percentile(values, .5):.1f}s max={max(values):.1f}s"
+          for (kind, status), values in sorted(operations["background"].items())])
+    section("Source imports (per lookup, including repeated attempts)")
+    rows([f"{operation}/{source} " + " ".join(f"{key}={row[key]}" for key in ("calls", "partial", "expected", "fetched", "omitted", "unchecked", "recovered"))
+          for (operation, source), row in sorted(operations["imports"].items())])
+    section("Browser asset failures and third-party scripts")
+    rows([f"{row['count']:>5} {asset} known_clients={len(row['clients'])} " +
+          " ".join(f"{key}={value}" for key, value in sorted(row["visibility"].items()))
+          for asset, row in sorted(operations["assets"].items(), key=lambda item: -item[1]["count"])][:args.top])
+    rows([f"{count:>5} {origin}" for origin, count in operations["third_party"].items()])
+    if not args.skip_nginx:
+        nginx, nginx_coverage = analyze_nginx(cutoff, until)
+        section("Nginx failures (separate observations; may overlap app errors)")
+        important = [(key, count) for key, count in nginx.items()
+                     if (key[0] == "access" and key[1].isdigit() and int(key[1]) >= 500)
+                     or (key[0] == "error" and key[1] in {"upstream_timeout", "upstream_or_other"})]
+        # A large scanner sweep must never push a proxy failure past --top.
+        rows([f"{count:>5} {kind} {status} {endpoint}" for (kind, status, endpoint), count in sorted(important, key=lambda item: -item[1])],
+             empty="  (no upstream/server failures observed in the covered records)")
+        rest = [(key, count) for key, count in nginx.most_common() if (key, count) not in important]
+        rows([f"{count:>5} {kind} {status} {endpoint}" for (kind, status, endpoint), count in rest[:args.top]])
+        rows(nginx_coverage)
     section(f"Slow requests (> {args.slow_threshold:g}s; streams excluded)")
     slow_rows = []
     for endpoint, values in access["durations"].items():
@@ -1222,6 +1538,12 @@ def main():
         f"{count:>5}  {reason:<20} from {len(errors['security_clients'].get(reason, ())) or '?'} client(s)"
         for reason, count in errors["security"].most_common(args.top)
     ], empty="  (none -- internet-wide scanner noise goes to var/logs/scanner.log)")
+    section("New accounts")
+    rows([
+        f"{when:%Y-%m-%d %H:%M}  #{account:<5} {email}"
+        + (f"  <- {signup_hint(email)}" if signup_hint(email) else "")
+        for when, account, email in sorted(errors["registrations"])
+    ], empty="  (none registered in this window)")
     section("SSE stream close reasons (from the app, not the access log)")
     rows([
         f"{len(values):>5}  {reason:<22} p50={percentile(values, .5):.0f}s "

@@ -110,6 +110,20 @@ def _require_database_url() -> None:
 
 def _build_app():
     sys.path.insert(0, str(REPO_ROOT))
+    # create_app() mirrors WARNING+ into var/logs/errors.log and opens
+    # scanner.log beside it. Both are dikarya-owned and not writable by the
+    # `tree` account that runs this, so every run printed "Could not open
+    # errors log". A one-shot changelog write has no business in the
+    # production logs anyway; its problems already reach the terminal through
+    # the console handlers. Point both at a scratch directory removed on exit
+    # (scanner.log is derived from ERROR_LOG_PATH's directory).
+    if "ERROR_LOG_PATH" not in os.environ:
+        import atexit
+        import shutil
+        import tempfile
+        scratch = tempfile.mkdtemp(prefix="dikarya-whats-new-")
+        atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+        os.environ["ERROR_LOG_PATH"] = os.path.join(scratch, "errors.log")
     from app import create_app
     return create_app()
 

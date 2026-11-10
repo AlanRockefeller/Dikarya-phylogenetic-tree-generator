@@ -110,8 +110,14 @@ _NULL_BYTE_RE = re.compile(r"(?:%00|\x00)")
 # port 443. A sweep asks for /etc/passwd on every host it can reach; only
 # somebody who has looked at Dikarya walks upward out of a job artifact route.
 # The distinction is worth making because the second one is a person.
+#
+# Alan 11/8/26 - The route name must be followed by "/": the traversal has to
+# start INSIDE one of our routes. With \b, /static../.git/config counted, and
+# that is the stock nginx alias "off-by-slash" probe, which every scanner tries
+# against the same ten directory names (static, js, css, img, media, ...) on
+# every host -- not someone who has looked at Dikarya.
 _APP_TRAVERSAL_SURFACE_RE = re.compile(
-    r"^/(?:api/)?(?:job|files|thumb|download|static)\b", re.IGNORECASE,
+    r"^/(?:api/)?(?:job|files|thumb|download|static)/", re.IGNORECASE,
 )
 
 # Dikarya's own on-disk layout. These names exist in AGENTS.md, in this
@@ -254,6 +260,18 @@ def _scanner_reason(path_lower, user_agent, status, method):
     return None
 
 
+def _is_scanner_vocabulary(path_lower):
+    """Does the path carry a token from the internet-wide sweep dictionaries?
+
+    Only the path-shape markers, not the status or user-agent rules of
+    _scanner_reason(): this answers "is this word a scanner's", nothing more.
+    """
+    return (
+        any(marker in path_lower for marker in SCANNER_MARKERS)
+        or SCRIPT_EXT_RE.search(path_lower) is not None
+    )
+
+
 def looks_weaponized(value):
     """Is this rejected value a typo, or an attempt at the tool behind it?
 
@@ -358,7 +376,12 @@ def classify_request_failure(
     # testing what the id parser accepts. A *valid-shaped* id that 404s is not:
     # ids are short and guessable by design (see the job-id conventions in
     # CLAUDE.md), and ordinary users hit stale links constantly.
-    if job_id_valid is False:
+    #
+    # Alan 11/8/26 - Nor is an "id" that is a scanner's own vocabulary. /job/.env
+    # is a .env sweep appending its dictionary to every directory it found on
+    # our pages (four Google Cloud hosts, one tool, 11/4-11/7), not a test of
+    # the id parser. It falls through to the scanner bucket below.
+    if job_id_valid is False and not _is_scanner_vocabulary(lower):
         return BUCKET_TARGETED, "job_id_malformed"
 
     if matched_route is None:

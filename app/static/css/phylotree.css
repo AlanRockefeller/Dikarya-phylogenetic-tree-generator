@@ -56,6 +56,18 @@ stroke: #999;
 stroke-width: 2px;
 }
 
+/* Alan 10/20/26 - Long-branch break marks and their true lengths (tree_viewer_phylotree_v2.js,
+   _drawBranchBreaks). Unscoped like the branch rule above, so an exported figure keeps them. */
+.branch-break-mark {
+fill: none;
+stroke: #999;
+stroke-width: 1.5px;
+}
+
+.branch-break-label {
+fill: #555;
+}
+
 .clade {
 fill: lightgrey;
 stroke: #222;

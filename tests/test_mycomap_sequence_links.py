@@ -46,6 +46,45 @@ def test_saved_sequence_id_resolves_without_remote_lookup(tmp_path):
         assert resolve_job_tip_url(tmp_path, TIP) == "https://mycomap.org/sequences/842537"
 
 
+@pytest.mark.parametrize("tip", ["_R_" + TIP, TIP.replace(" ", "  ")])
+def test_original_and_legacy_normalized_links_find_the_same_saved_tip(tmp_path, tip):
+    _write_job(tmp_path, tip=tip, metadata={"mycomap_sequence_id": 842537})
+    with patch("app.services.mycomap_org_service.observation_sequences") as lookup:
+        assert resolve_job_tip_url(tmp_path, tip) == "https://mycomap.org/sequences/842537"
+        assert resolve_job_tip_url(tmp_path, TIP) == "https://mycomap.org/sequences/842537"
+    lookup.assert_not_called()
+
+
+def test_legacy_reverse_marker_can_match_unmarked_metadata_and_fasta(tmp_path):
+    _write_job(tmp_path, metadata={"mycomap_sequence_id": 842537})
+    (tmp_path / "tree_state.json").write_text(json.dumps({
+        "tree_structure": {"name": "_R_" + TIP, "original_name": "_R_" + TIP},
+    }))
+    assert resolve_job_tip_url(tmp_path, "_R_" + TIP) == "https://mycomap.org/sequences/842537"
+
+    info_path = tmp_path / "input_info.json"
+    info = json.loads(info_path.read_text())
+    info["sequence_metadata"][0].pop("mycomap_sequence_id")
+    info_path.write_text(json.dumps(info))
+    with patch("app.services.mycomap_org_service.observation_sequences", return_value=[
+        {"id": "842537", "sequence": SEQUENCE},
+    ]):
+        assert resolve_job_tip_url(tmp_path, TIP) == "https://mycomap.org/sequences/842537"
+
+
+def test_normalized_label_collisions_are_not_guessed_and_exact_names_still_work(tmp_path):
+    first = "_R_" + TIP
+    second = TIP.replace(" ", "  ")
+    _write_job(tmp_path, tip=first, metadata={"mycomap_sequence_id": 842537})
+    (tmp_path / "tree_state.json").write_text(json.dumps({
+        "tree_structure": {"children": [{"name": first}, {"name": second}]},
+    }))
+    with pytest.raises(MycoMapSequenceLinkError, match="more than one") as caught:
+        resolve_job_tip_url(tmp_path, TIP)
+    assert caught.value.status == 409
+    assert resolve_job_tip_url(tmp_path, first) == "https://mycomap.org/sequences/842537"
+
+
 def test_old_job_matches_exact_dna_and_ric_among_observation_records(tmp_path):
     _write_job(tmp_path, renamed="Boletus edulis from Ohio")
     rows = [
@@ -92,3 +131,15 @@ def test_ambiguous_identical_records_without_ric_match_are_not_guessed(tmp_path)
         with pytest.raises(MycoMapSequenceLinkError, match="more than one") as caught:
             resolve_job_tip_url(tmp_path, tip)
     assert caught.value.status == 409
+
+
+def test_ric_field_picks_the_lab_record_when_its_title_has_no_ric(tmp_path):
+    # Alan 11/9/26 - Real shape (iNat248968282): an iNaturalist copy and the ONT
+    # record share the DNA, and the ONT title carries no "ric=".
+    tip = "iNat393666515 Lepiota Greenville Ohio US RiC 480"
+    _write_job(tmp_path, tip=tip)
+    with patch("app.services.mycomap_org_service.observation_sequences", return_value=[
+        {"id": "438094", "title": "iNaturalist #393666515", "ric": 0, "sequence": SEQUENCE},
+        {"id": "296872", "title": "F07--iNat393666515-1", "ric": 480, "sequence": SEQUENCE},
+    ]):
+        assert resolve_job_tip_url(tmp_path, tip) == "https://mycomap.org/sequences/296872"

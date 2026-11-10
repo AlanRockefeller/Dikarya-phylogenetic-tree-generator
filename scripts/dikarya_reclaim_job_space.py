@@ -33,7 +33,6 @@ import argparse
 import gzip
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -46,6 +45,7 @@ sys.path.insert(0, str(REPO_ROOT))
 # Reuse the production filter so the retroactive pass and the live pipeline
 # agree exactly on what counts as MAFFT noise.
 from app.services.alignment_service import _keep_mafft_log_line  # noqa: E402
+from app.services.security_utils import validate_job_id  # noqa: E402
 
 GZIP_LEVEL = 6
 MIN_COMPRESS_BYTES = 4096
@@ -298,9 +298,6 @@ PASS_FUNCS = {
     "alignments": pass_alignments,
 }
 
-JOB_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
-
-
 def recently_touched(job_dir: Path, min_age_seconds: float) -> bool:
     """
     True if anything in the job was modified inside the age window.
@@ -363,7 +360,10 @@ def main():
     min_age_seconds = args.min_age_hours * 3600.0
     tally = Tally()
 
-    job_dirs = sorted(d for d in jobs_root.iterdir() if d.is_dir() and JOB_ID_RE.match(d.name))
+    job_dirs = sorted(
+        d for d in jobs_root.iterdir()
+        if d.is_dir() and not d.is_symlink() and validate_job_id(d.name)
+    )
     if args.limit:
         job_dirs = job_dirs[: args.limit]
 

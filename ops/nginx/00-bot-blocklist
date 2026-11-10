@@ -1,0 +1,69 @@
+# Bot blocklist for dikarya.us
+#
+# Install as /etc/nginx/sites-available/00-bot-blocklist and symlink into
+# sites-enabled. nginx.conf includes only /etc/nginx/sites-enabled/*, and that
+# include sits in the http context, so this file lives there too -- same pattern
+# as 00-labels-limits. The 00- prefix makes it sort before "dikarya", so the map
+# exists before the server block that uses $blocked_bot.
+#
+#   sudo install -o root -g root -m 0644 \
+#       /var/www/dikarya/ops/nginx/00-bot-blocklist \
+#       /etc/nginx/sites-available/00-bot-blocklist
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# This repository copy is the source; the installed file is a copy of it.
+#
+# Why: in the 12-14 Aug 2026 sample, ImageBot made 43,466 requests -- 88% of
+# all traffic -- every one a 404 against a /thumb/<n>.jpg namespace this site has
+# never had. Blocking at nginx means those never reach Flask and never take a
+# request slot away from a real user. (Gunicorn then ran --threads 2, 8 slots;
+# it is 4 workers x 8 threads now, but the reasoning is unchanged.)
+#
+# Search engines are deliberately NOT in this list. See app/static/robots.txt,
+# which welcomes them and points at /sitemap.xml.
+
+# Per-client cap on concurrent SSE streams (/api/job/<id>/events). Each open
+# stream holds one of Gunicorn's request slots for as long as its job runs, and
+# the app now lets a genuinely long job stream for hours rather than cutting it
+# every 30 minutes. This is what keeps that safe: one client can follow a handful
+# of jobs at once, but cannot open dozens of tabs and exhaust the pool.
+limit_conn_zone $binary_remote_addr zone=dikarya_sse_conn:10m;
+
+map $http_user_agent $blocked_bot_ua {
+    default                 0;
+
+    # Image scrapers hammering /thumb/*.jpg (the actual incident).
+    "~*ImageBot"            1;
+    "~*img2dataset"         1;
+
+    # SEO/backlink crawlers: heavy fetchers, no readers sent back.
+    "~*AhrefsBot"           1;
+    "~*SemrushBot"          1;
+    "~*MJ12bot"             1;
+    "~*DotBot"              1;
+    "~*PetalBot"            1;
+    "~*DataForSeoBot"       1;
+    "~*BLEXBot"             1;
+    "~*ZoominfoBot"         1;
+    "~*serpstatbot"         1;
+
+    # Bulk AI-training scraper that ignores robots.txt in practice.
+    "~*Bytespider"          1;
+
+    # Vulnerability scanners. Deliberately NOT blocking generic HTTP client UAs
+    # (python-requests, curl, Go-http-client): /api_v1 is a documented public API
+    # and those are exactly what a user's own script identifies itself as.
+    "~*(zgrab|masscan|nikto|sqlmap)" 1;
+}
+
+# Alan 11/8/26 - A blocked crawler may still read /robots.txt. The server
+# block's `if ($blocked_bot) { return 403; }` runs before location matching, so
+# it used to refuse robots.txt too, and the "Disallow: /" groups robots.txt
+# keeps for exactly these bots could never be read: compliant crawlers kept
+# retrying (758 refusals from 4 to 8 Nov, 671 of them SemrushBot). Exact keys
+# are matched before regexes, so "1:/robots.txt" wins over "~^1:".
+map "$blocked_bot_ua:$uri" $blocked_bot {
+    default                 0;
+    "1:/robots.txt"         0;
+    "~^1:"                  1;
+}

@@ -7,6 +7,55 @@ import re
 
 _INTEGER_TEXT = re.compile(r"^[+-]?\d+$")
 
+# Shared by submission validation and the final, post-processing worker guard.
+TREE_MIN_SEQUENCES = {"iqtree": 3, "iqtree_fast": 3, "raxml": 4,
+                      "mrbayes": 4, "fasttree": 2, "nj": 2}
+TREE_METHOD_LABELS = {"iqtree": "IQ-TREE", "iqtree_fast": "Quick Tree (IQ-TREE)",
+                      "raxml": "RAxML-NG", "mrbayes": "MrBayes",
+                      "fasttree": "FastTree", "nj": "Neighbor Joining"}
+
+
+def tree_sequence_count_error(method, count, submitted_count=None):
+    method = str(method or "").lower()
+    minimum = TREE_MIN_SEQUENCES.get(method)
+    if minimum is not None and count < minimum:
+        removed = ""
+        if isinstance(submitted_count, int) and submitted_count > count:
+            # Dedup ran first, so "the input contains 2" would contradict the
+            # 4 the user just submitted.
+            removed = (
+                f" ({submitted_count} were submitted; the others were removed "
+                "as duplicates)"
+            )
+        return (
+            f"{TREE_METHOD_LABELS[method]} needs at least {minimum} sequences; "
+            f"the input contains {count}{removed}. Add more sequences (a close relative "
+            "or an outgroup works well), or choose a method that supports this count."
+        )
+    return None
+
+
+def submitted_tree_count_error(params, submitted_count=None):
+    """Validate known, prepared FASTA counts; leave future imports to the worker.
+
+    ``submitted_count`` is the record count before dedup, so the message can
+    say why it differs from what the user sent.
+    """
+    text = params.get("sequence")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if params.get("_inat_tree_preparation") or params.get("_mo_tree_preparation"):
+        return None
+    # The same parser the worker reads the submission with: it strips each
+    # line, so an indented '>' header is still a record.
+    from app.services.fasta_utils import parse_fasta_records
+    count = len(parse_fasta_records(text))
+    # Match the worker: omitted/unknown modes mean auto, and BLAST only
+    # augments a single query. Multi-record counts are already final here.
+    if count == 1 and str(params.get("blast_mode") or "auto").strip().lower() != "off":
+        return None
+    return tree_sequence_count_error(params.get("tree_method"), count, submitted_count)
+
 
 def _coerce_ufboot_count(bootstrap):
     """Return ``bootstrap`` as an exact integer, or None if it is not one.

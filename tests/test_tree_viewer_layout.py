@@ -393,6 +393,22 @@ class TreeViewerLayoutTests(unittest.TestCase):
         viewer = (TEMPLATES / "job_viewer.html").read_text(encoding="utf-8")
         self.assertIn("{% block main_width %}max-w-none{% endblock %}", viewer)
 
+    def test_critical_script_failures_have_a_visible_retry_fallback(self):
+        html = render(**EVERYTHING)
+        critical_sources = re.findall(
+            r'<script data-viewer-critical="true" src="([^"]+)"', html
+        )
+        self.assertTrue(
+            any("tree_viewer_controller.js" in source for source in critical_sources)
+        )
+        self.assertTrue(any("phylotree.js" in source for source in critical_sources))
+
+        base = (TEMPLATES / "base_modern.html").read_text(encoding="utf-8")
+        self.assertIn("Viewer failed to load", base)
+        self.assertIn("Retry viewer", base)
+        self.assertIn("event.target.dataset?.viewerCritical === 'true'", base)
+        self.assertIn("window.location.reload()", base)
+
     def test_settings_panel_starts_closed_and_is_hidden_on_touch(self):
         controller = CONTROLLER.read_text(encoding="utf-8")
         self.assertIn("setSettingsPanelOpen(false);", controller)

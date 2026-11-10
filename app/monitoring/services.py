@@ -3,6 +3,8 @@ import os
 import re
 import time
 import psutil
+import subprocess
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from sqlalchemy import text, func
@@ -17,6 +19,41 @@ _HEALTH_LAST_EMIT = {}
 # Value per metric at its last logged line, for reporting movement between lines.
 _HEALTH_LAST_VALUE = {}
 HEALTH_COOLDOWN_SECONDS = 6 * 3600
+_DISK_SAMPLES = deque(maxlen=61)
+_DISK_DIRECTORY_SIZES = {}
+_WORKER_HEALTH_STARTED_AT = None
+
+
+def _disk_growth_detail(free_bytes, now):
+    _DISK_SAMPLES.append((now, free_bytes))
+    first_time, first_free = _DISK_SAMPLES[0]
+    elapsed = now - first_time
+    growth = max(0, (first_free - free_bytes) / elapsed) if elapsed >= 300 else 0
+    exhaustion = round(free_bytes / growth) if growth > 0 else None
+    return growth, exhaustion
+
+
+def _log_disk_directories():
+    """Bounded, infrequent attribution; never walk job contents in a request."""
+    root = Path(__file__).resolve().parents[2]
+    paths = {"jobs": root / "var/jobs", "cache": root / "cache",
+             "app_logs": root / "var/logs", "system_logs": Path("/var/log"),
+             "shared_data": Path("/data")}
+    for label, path in paths.items():
+        try:
+            result = subprocess.run(["du", "-sx", "-B1", "--", str(path)],
+                                    capture_output=True, text=True, timeout=2)
+            if result.returncode:
+                raise ValueError("incomplete directory measurement")
+            size = int(result.stdout.split()[0])
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            logger.warning("event=health.disk.directory directory=%s measurement=unavailable", label)
+            continue
+        previous = _DISK_DIRECTORY_SIZES.get(label)
+        delta = size - previous if previous is not None else 0
+        _DISK_DIRECTORY_SIZES[label] = size
+        logger.warning("event=health.disk.directory directory=%s bytes=%s delta_bytes=%s baseline=%s",
+                    label, size, delta, str(previous is None).lower())
 
 
 def _transition(name, unhealthy, detail, now=None):
@@ -45,11 +82,42 @@ def _transition(name, unhealthy, detail, now=None):
     return False
 
 
+def _emit_worker_health(now):
+    """Detect loss of any queue's staffing, with a collector startup grace."""
+    global _WORKER_HEALTH_STARTED_AT
+    if _WORKER_HEALTH_STARTED_AT is None:
+        _WORKER_HEALTH_STARTED_AT = now
+    grace = current_app.config.get("WORKER_HEALTH_STARTUP_GRACE_SECONDS", 120)
+    starting = now - _WORKER_HEALTH_STARTED_AT < grace
+    details = get_worker_queue_health()
+    workers = details.get("workers", [])
+    healthy = [worker for worker in workers if worker.get("status") == "healthy"]
+    if healthy or not starting:
+        _transition(
+            "worker_heartbeat", not healthy,
+            f"healthy={len(healthy)} total={len(workers)} states={','.join(sorted({w.get('status', 'unknown') for w in workers})) or 'missing'}",
+            now=now,
+        )
+    if not details.get("available", True):
+        return  # Unreadable RQ membership is not evidence that queues are unstaffed.
+    expected = current_app.config.get("WORKER_EXPECTED_COUNTS", {
+        "phylo_high": 2, "phylo_bulk": 1, "voucher_sync": 1,
+    })
+    for name, minimum in expected.items():
+        count = sum(name in worker.get("queues", []) for worker in healthy)
+        if count >= minimum or not starting:
+            _transition(
+                f"worker_queue.{name}", count < minimum,
+                f"queue={name} healthy={count} expected={minimum}", now=now,
+            )
+
+
 def emit_health_transitions(metrics):
     """Perform cheap health checks and emit only transitions/cooldown reminders."""
     disk_percent = float(metrics.get("disk_usage") or 0)
     disk_free = int(metrics.get("disk_free_bytes") or 0)
     disk_was_bad = _HEALTH_STATES.get("disk", False)
+    growth, exhaustion = _disk_growth_detail(disk_free, time.monotonic())
     disk_bad = disk_percent >= (85 if disk_was_bad else 90)
     # Free space at the previous emission, so a repeat warning says whether the
     # situation is getting worse or merely still true. A flat number repeated
@@ -59,7 +127,8 @@ def emit_health_transitions(metrics):
     logged = _transition(
         "disk", disk_bad,
         f"percent={disk_percent:.1f} free_bytes={disk_free}"
-        f" mount={metrics.get('disk_mountpoint') or '?'}{delta}",
+        f" mount={metrics.get('disk_mountpoint') or '?'}{delta}"
+        f" growth_bytes_per_second={growth:.0f} time_to_full_seconds={exhaustion if exhaustion is not None else 'unknown'}",
     )
     # Alan 10/8/26 - Record the value only when a line was logged. It used to be
     # overwritten on every one-minute tick while the disk was unhealthy, so each
@@ -68,8 +137,14 @@ def emit_health_transitions(metrics):
     if logged:
         if disk_bad:
             _HEALTH_LAST_VALUE["disk_free_bytes"] = disk_free
+            if "disk_free_bytes" in metrics:
+                _log_disk_directories()
         else:
             _HEALTH_LAST_VALUE.pop("disk_free_bytes", None)
+    _transition("disk_critical", disk_percent >= (93 if _HEALTH_STATES.get("disk_critical") else 95),
+                f"percent={disk_percent:.1f} free_bytes={disk_free}")
+    _transition("disk_growth", exhaustion is not None and exhaustion < 6 * 3600,
+                f"growth_bytes_per_second={growth:.0f} time_to_full_seconds={exhaustion if exhaustion is not None else 'unknown'}")
     memory_percent = float(metrics.get("memory_percent") or 0)
     memory_was_bad = _HEALTH_STATES.get("memory", False)
     _transition(
@@ -77,23 +152,21 @@ def emit_health_transitions(metrics):
         f"percent={memory_percent:.1f} available_bytes={int(metrics.get('memory_available_bytes') or 0)}",
     )
 
-    workers = get_worker_status().get("workers", [])
-    healthy = [worker for worker in workers if worker.get("status") == "healthy"]
-    _transition(
-        "worker_heartbeat", not healthy,
-        f"healthy={len(healthy)} total={len(workers)} states={','.join(sorted({w.get('status', 'unknown') for w in workers})) or 'missing'}",
-    )
+    _emit_worker_health(time.monotonic())
 
     try:
-        from app.workers.queue import get_redis_connection, QUEUE_HIGH, QUEUE_BULK
+        from app.workers.queue import get_redis_connection, QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER
         from rq.registry import StartedJobRegistry
         redis_conn = get_redis_connection()
         redis_conn.ping()
-        queue_depth = sum(int(redis_conn.llen(f"rq:queue:{name}")) for name in (QUEUE_HIGH, QUEUE_BULK))
-        wip = sum(StartedJobRegistry(name=name, connection=redis_conn).count for name in (QUEUE_HIGH, QUEUE_BULK))
+        queue_names = (QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER)
+        depths = {name: int(redis_conn.llen(f"rq:queue:{name}")) for name in queue_names}
+        queue_depth = sum(depths.values())
+        wip = sum(StartedJobRegistry(name=name, connection=redis_conn).count for name in queue_names)
         _transition("redis", False, "ping=ok")
         queue_was_bad = _HEALTH_STATES.get("queue_depth", False)
-        _transition("queue_depth", queue_depth >= (10 if queue_was_bad else 25), f"queued={queue_depth} wip={wip}")
+        detail = " ".join(f"{name}={depth}" for name, depth in depths.items())
+        _transition("queue_depth", queue_depth >= (10 if queue_was_bad else 25), f"queued={queue_depth} wip={wip} {detail}")
     except Exception as exc:
         _transition("redis", True, f"exception={type(exc).__name__}")
 
@@ -918,11 +991,42 @@ def get_active_jobs(max_queued=25):
     return payload
 
 
+def get_worker_queue_health():
+    """Heartbeat status plus the queues each worker serves, and nothing else.
+
+    What the minutely health collector needs. get_worker_details() also reads
+    every worker's state, current job and working time, which this loop would
+    throw away, and it logs a WARNING whenever RQ is unreadable -- once a
+    minute for the length of a Redis outage, which the cooldown-limited
+    ``health.redis`` transition already reports.
+    """
+    status = get_worker_status()
+    workers = [dict(entry) for entry in status.get("workers", [])]
+    available = True
+    queues_by_name = {}
+    try:
+        from app.workers.queue import get_redis_connection
+        from rq import Worker
+
+        for worker in Worker.all(connection=get_redis_connection()):
+            queues_by_name[worker.name] = [q.name for q in getattr(worker, "queues", [])]
+    except Exception as exc:
+        # DEBUG, not WARNING: an outage would repeat this every minute. It still
+        # leaves a trail when the cause is something other than Redis.
+        available = False
+        logger.debug("event=health.worker_queues_unreadable exception=%s",
+                     type(exc).__name__, exc_info=True)
+    for entry in workers:
+        entry["queues"] = queues_by_name.get(entry.get("id"), [])
+    return {"available": available, "workers": workers}
+
+
 def get_worker_details():
     """Heartbeat files joined with what RQ knows about each worker process."""
     status = get_worker_status()
     workers = {entry["id"]: dict(entry) for entry in status.get("workers", [])}
 
+    available = True
     try:
         from app.workers.queue import get_redis_connection
         from rq import Worker
@@ -954,6 +1058,7 @@ def get_worker_details():
                 "rq_version": str(getattr(worker, "version", "") or "")[:20],
             })
     except Exception as exc:
+        available = False
         logger.warning("worker details: RQ registry unreadable: %s", exc)
 
     for entry in workers.values():
@@ -961,7 +1066,7 @@ def get_worker_details():
         entry.setdefault("queues", [])
 
     rank = {"healthy": 0, "stale": 1, "dead": 2}
-    result = {"workers": sorted(
+    result = {"available": available, "workers": sorted(
         workers.values(),
         key=lambda w: (rank.get(w.get("status"), 9), w.get("age_seconds") or 0),
     )}

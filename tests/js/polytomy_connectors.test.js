@@ -129,11 +129,18 @@ class FakeElement {
 function matchesCompound(el, compound) {
     const nots = [];
     const base = compound.replace(/:not\(([^)]*)\)/g, (_, inner) => { nots.push(inner); return ''; });
-    const m = base.match(/^([a-z]*)((?:\.[\w-]+)*)$/i);
+    const m = base.match(/^([a-z]*)((?:\.[\w-]+)*)((?:\[[\w-]+(?:=(?:"[^"]*"|'[^']*'|[\w-]+))?\])*)$/i);
     if (!m) throw new Error(`fake DOM cannot parse selector "${compound}"`);
     if (m[1] && el.tagName !== m[1]) return false;
     const classes = m[2].split('.').filter(Boolean);
     if (!classes.every((c) => el.classList.contains(c))) return false;
+    const attrs = [...m[3].matchAll(/\[([\w-]+)(?:=(?:"([^"]*)"|'([^']*)'|([\w-]+)))?\]/g)];
+    for (const [, name, dq, sq, bare] of attrs) {
+        const value = el.getAttribute(name);
+        if (value === null || value === undefined) return false;
+        const wanted = dq ?? sq ?? bare;
+        if (wanted !== undefined && String(value) !== wanted) return false;
+    }
     return !nots.some((inner) => matchesCompound(el, inner));
 }
 

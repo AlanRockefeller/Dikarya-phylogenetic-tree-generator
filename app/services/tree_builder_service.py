@@ -44,7 +44,9 @@ from app.services.identical_sequences import (
     plan_identical_collapse,
     restore_identical_tips,
 )
-from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.tree_parameter_validation import (
+    TREE_MIN_SEQUENCES, TREE_METHOD_LABELS, validate_iqtree_ufboot_count,
+)
 from app.services.tree_io import (
     newick_file_to_nexus,
     reroot_preserving_support,
@@ -91,6 +93,35 @@ _IQTREE_DEFAULT_MODEL = "GTR+G"
 # naming one. MF selects only; MFP selects then infers the tree. TEST/TESTNEW
 # are the jModelTest-compatible aliases.
 _MODEL_FINDER_REQUESTS = frozenset({"MF", "MFP", "TEST", "TESTNEW", "TESTONLY", "TESTNEWONLY"})
+
+# Fewest sequences each builder will accept, measured against the installed
+# binaries: IQ-TREE exits 2 ("Alignment must have at least 3 sequences"),
+# RAxML-NG and MrBayes refuse fewer than four taxa. FastTree and NJ build a
+# tree from two. Below these the tool's own failure reached the job page as a
+# generic "contact Alan" error (job ocpr, a two-sequence Quick Tree). The table
+# is TREE_MIN_SEQUENCES in tree_parameter_validation, shared with submission.
+
+
+def _require_enough_sequences(method: str, alignment_fasta: Path) -> None:
+    """Refuse an alignment the selected builder cannot run, in plain words."""
+    minimum = TREE_MIN_SEQUENCES.get(method)
+    if not minimum:
+        return
+    from app.services.artifact_storage import artifact_exists, open_artifact
+    if not artifact_exists(alignment_fasta):
+        return  # the builder reports a missing alignment as it always has
+    with open_artifact(alignment_fasta, "rt") as handle:
+        count = sum(1 for line in handle if line.startswith(">"))
+    if count >= minimum:
+        return
+    found = "only one sequence" if count == 1 else f"only {count} sequences"
+    raise ValueError(
+        f"The alignment has {found}, and {TREE_METHOD_LABELS[method]} needs at "
+        f"least {minimum} to build a tree. Add more sequences (a close relative "
+        "or an outgroup works well) and submit again. If you submitted more than "
+        f"{count}, the others were removed by an earlier step, for example as "
+        "duplicates."
+    )
 
 
 def _is_model_finder_request(model_str: str) -> bool:
@@ -155,7 +186,8 @@ def run_tree_builder(
     method = params.method.lower()
     params.bootstrap = validate_iqtree_ufboot_count(method, params.bootstrap)
     task_logger.info(f"Starting tree building with method: {method}")
-    
+    _require_enough_sequences(method, alignment_fasta)
+
     # `model` and `bootstrap` describe what the user asked for. Anything a
     # method does not actually honour is nulled out below rather than echoed
     # back: this file is what the viewer and the downstream analysis cite, and
@@ -1272,14 +1304,22 @@ def _run_raxml(
             "bootstrap_stopped_early": False,
         }
     )
-    if resolved.warnings:
+    # Alan 11/8/26 - Only adjustments that cut back what was requested are
+    # DEGRADED; resolved.notices (e.g. early stopping turned off for a
+    # publication run, which searches MORE thoroughly) are still listed in
+    # parameter_warnings below but did not degrade anything.
+    # getattr: a worker that imported raxml_validator before `notices` existed
+    # can still load this module fresh in a forked job.
+    notices = set(getattr(resolved, "notices", ()) or ())
+    degrading = [w for w in resolved.warnings if w not in notices]
+    if degrading:
         from app.services.log_context import log_degradation
 
         log_degradation(
             task_logger, "raxml_parameters_adjusted",
             "RAxML-NG ran with scientifically meaningful parameter adjustments; "
             "see tree_metadata.json for requested, applied, and warning details",
-            warning_count=len(resolved.warnings),
+            warning_count=len(degrading),
         )
 
     return resolved.model, model_selected_by, {
@@ -1512,6 +1552,89 @@ MRBAYES_MIN_ESS = 200.0
 # parameter, so a gamma-only run that hits it is retried once with invgamma.
 MRBAYES_NAN_MARKER = "Log likelihood nan"
 
+# An early-stopped run that missed ESS/PSRF is continued once, but bounded:
+# running on to the full ngen ceiling (1,000,000 by default) from a stop at
+# 20,000 is ~50x the work, on a worker that runs one job at a time. The
+# continuation ends at the EARLIEST of:
+#   - MRBAYES_CONTINUATION_MAX_FACTOR x the generations the first segment ran;
+#   - the length at which min ESS is predicted to reach MRBAYES_MIN_ESS (ESS
+#     grows about linearly with samples), times MRBAYES_CONTINUATION_ESS_HEADROOM;
+#   - what fits in MRBAYES_CONTINUATION_MAX_SECONDS, and in the remaining
+#     MrBayes budget / MRBAYES_CONTINUATION_TIME_MARGIN, at the first segment's
+#     own measured speed;
+#   - the original ngen ceiling.
+# An extension shorter than MRBAYES_CONTINUATION_MIN_EXTENSION x the first
+# segment is skipped: too little to change the diagnostics.
+MRBAYES_CONTINUATION_MAX_FACTOR = 4
+MRBAYES_CONTINUATION_ESS_HEADROOM = 1.25
+MRBAYES_CONTINUATION_MAX_SECONDS = 3600
+MRBAYES_CONTINUATION_TIME_MARGIN = 1.2
+MRBAYES_CONTINUATION_MIN_EXTENSION = 0.5
+
+
+def _mrbayes_continuation_target(completed: int, ngen: int, samplefreq: int,
+                                 min_ess, seconds_per_generation: float,
+                                 seconds_left: float) -> Tuple[Optional[int], str]:
+    """Total generations a one-off continuation should run to, or None.
+
+    Returns ``(target, limited_by)``; ``limited_by`` names the bound that set
+    the target, or why there is no continuation.
+    """
+    bounds = {
+        "max_factor": completed * MRBAYES_CONTINUATION_MAX_FACTOR,
+        "max_generations": ngen,
+    }
+    if isinstance(min_ess, (int, float)) and 0 < min_ess < MRBAYES_MIN_ESS:
+        bounds["ess_target"] = math.ceil(
+            completed * MRBAYES_MIN_ESS / min_ess * MRBAYES_CONTINUATION_ESS_HEADROOM
+        )
+    allowed_seconds = min(MRBAYES_CONTINUATION_MAX_SECONDS,
+                          seconds_left / MRBAYES_CONTINUATION_TIME_MARGIN)
+    if seconds_per_generation > 0:
+        bounds["time"] = completed + int(max(0.0, allowed_seconds) / seconds_per_generation)
+    limited_by = min(bounds, key=bounds.get)
+    # Whole samples only, so the appended run ends on a sampled generation.
+    target = bounds[limited_by] // samplefreq * samplefreq
+    if target - completed < max(samplefreq, completed * MRBAYES_CONTINUATION_MIN_EXTENSION):
+        return None, limited_by
+    return target, limited_by
+
+# The first segment's files are copied here before the continuation appends to
+# them, so a failed continuation can hand back the finished first result.
+MRBAYES_SEGMENT_BACKUP_DIRNAME = ".mrbayes_first_segment"
+
+
+def _snapshot_mrbayes_run(nexus_input: Path) -> Optional[Path]:
+    """Copy a finished MrBayes run (input + every output) aside, or None."""
+    backup = nexus_input.parent / MRBAYES_SEGMENT_BACKUP_DIRNAME
+    try:
+        shutil.rmtree(backup, ignore_errors=True)
+        backup.mkdir()
+        for path in nexus_input.parent.glob(f"{nexus_input.name}*"):
+            if path.is_file():
+                shutil.copy2(path, backup / path.name)
+        return backup
+    except OSError as exc:
+        logger.warning("Could not snapshot the MrBayes run before continuing it: %s", exc)
+        shutil.rmtree(backup, ignore_errors=True)
+        return None
+
+
+def _restore_mrbayes_run(nexus_input: Path, backup: Path) -> bool:
+    """Put a snapshot from _snapshot_mrbayes_run back in place of the run."""
+    try:
+        for path in nexus_input.parent.glob(f"{nexus_input.name}*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+        for path in backup.iterdir():
+            os.replace(path, nexus_input.parent / path.name)
+        return True
+    except OSError as exc:
+        logger.warning("Could not restore the first MrBayes segment: %s", exc)
+        return False
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
+
 
 def _mrbayes_nan_failure_message(fallback_tried: bool) -> str:
     """User-facing text for a run MrBayes abandoned on a NaN likelihood."""
@@ -1586,7 +1709,7 @@ def _mrbayes_lset_from_model(model_str: str, task_logger) -> Tuple[int, str, boo
     return nst, rates, equal_freqs, f"{base}{suffix}"
 
 
-def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
+def _read_mrbayes_convergence(nexus_input: Path, task_logger, *, log_result=True) -> Dict[str, Any]:
     """Read the convergence diagnostics MrBayes writes beside the tree.
 
     MrBayes has always written these files; nothing read them, so a run that
@@ -1597,13 +1720,16 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
       frequencies (ASDSF), present whenever nruns > 1.
     - ``.pstat`` carries per-parameter minESS/avgESS and PSRF.
     """
+    from app.services.artifact_storage import open_artifact
     diagnostics: Dict[str, Any] = {}
 
     mcmc_path = Path(f"{nexus_input}.mcmc")
     try:
         header = None
         last_row = None
-        for line in mcmc_path.read_text(errors="replace").splitlines():
+        with open_artifact(mcmc_path, "rt", errors="replace") as handle:
+            lines = handle.read().splitlines()
+        for line in lines:
             if not line or line.startswith("["):
                 continue
             fields = line.split("\t")
@@ -1622,15 +1748,14 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
                     # the requested maximum.
                     diagnostics["mcmc_generations_completed"] = int(float(value))
     except (OSError, ValueError) as exc:
-        task_logger.warning("Could not read MrBayes ASDSF: %s", exc)
+        if log_result:
+            task_logger.warning("Could not read MrBayes ASDSF: %s", exc)
 
     pstat_path = Path(f"{nexus_input}.pstat")
     try:
-        rows = [
-            line.split("\t")
-            for line in pstat_path.read_text(errors="replace").splitlines()
-            if line and not line.startswith("[")
-        ]
+        with open_artifact(pstat_path, "rt", errors="replace") as handle:
+            rows = [line.rstrip("\r\n").split("\t") for line in handle
+                    if line.strip() and not line.startswith("[")]
         if len(rows) > 1:
             header = [h.strip().lower() for h in rows[0]]
             ess_idx = header.index("miness") if "miness" in header else None
@@ -1646,7 +1771,8 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
             if psrf_values:
                 diagnostics["max_psrf"] = max(psrf_values)
     except (OSError, ValueError) as exc:
-        task_logger.warning("Could not read MrBayes PSRF/ESS: %s", exc)
+        if log_result:
+            task_logger.warning("Could not read MrBayes PSRF/ESS: %s", exc)
 
     problems = []
     asdsf = diagnostics.get("asdsf")
@@ -1676,6 +1802,8 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
         diagnostics["convergence_unavailable"] = (
             "MrBayes wrote no readable ASDSF, PSRF or ESS diagnostic"
         )
+        if not log_result:
+            return diagnostics
         from app.services.log_context import log_degradation
 
         log_degradation(
@@ -1693,6 +1821,8 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
     diagnostics["converged"] = not problems
     if problems:
         diagnostics["convergence_warnings"] = problems
+        if not log_result:
+            return diagnostics
         from app.services.log_context import log_degradation
 
         log_degradation(
@@ -1705,7 +1835,7 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
             "on this tree should not be trusted; re-run with more generations.",
             "; ".join(problems),
         )
-    else:
+    elif log_result:
         task_logger.info("MrBayes convergence check passed: %s", diagnostics)
 
     return diagnostics
@@ -1790,7 +1920,8 @@ def _run_mrbayes(
     # MrBayes requires Nexus input with a block
     nexus_input = output_newick.parent / "mrbayes_input.nex"
 
-    def _write_mrbayes_input(run_rates: str) -> None:
+    def _write_mrbayes_input(run_rates: str, resume: bool = False,
+                             run_ngen: Optional[int] = None) -> None:
         _convert_fasta_to_nexus(sanitized_fasta, nexus_input)
 
         # Append MrBayes block
@@ -1816,11 +1947,17 @@ def _run_mrbayes(
                 # HKY and GTR respectively, which is what it silently did before.
                 f.write("   prset statefreqpr=fixed(equal);\n")
             mcmc_opts = (
-                f"ngen={ngen} nchains={nchains} nruns={nruns} "
+                f"ngen={run_ngen or ngen} nchains={nchains} nruns={nruns} "
                 f"samplefreq={samplefreq} printfreq={printfreq} "
                 f"relburnin=yes burninfrac={burnin_value}"
             )
-            if stop_early:
+            if resume:
+                # append=yes restores the chains and samples from this exact
+                # prefix's checkpoint; ngen is then the TOTAL to run to, set by
+                # _mrbayes_continuation_target() and never above the ceiling.
+                # samplefreq/printfreq stay those of the first segment.
+                mcmc_opts += " append=yes checkpoint=yes stoprule=no"
+            elif stop_early:
                 # ngen becomes an upper bound: MrBayes stops as soon as the average
                 # standard deviation of split frequencies between the independent
                 # runs drops below stopval, which saves computation without
@@ -1829,7 +1966,7 @@ def _run_mrbayes(
                 # mcmcdiagn is stated explicitly rather than relied on: the
                 # diagnostics it writes are what the stop rule is evaluated from.
                 mcmc_opts += (
-                    f" mcmcdiagn=yes stoprule=yes stopval={stopval}"
+                    f" mcmcdiagn=yes checkpoint=yes stoprule=yes stopval={stopval}"
                 )
             f.write(f"   mcmc {mcmc_opts};\n")
             f.write(f"   sump relburnin=yes burninfrac={burnin_value};\n")
@@ -1844,15 +1981,23 @@ def _run_mrbayes(
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
 
     rate_fallback: Optional[Dict[str, Any]] = None
+    continuation = None
+    resume = False
+    segment_backup: Optional[Path] = None
+    continuation_ngen: Optional[int] = None
+    # A snapshot left behind by a worker that died mid-continuation.
+    shutil.rmtree(nexus_input.parent / MRBAYES_SEGMENT_BACKUP_DIRNAME, ignore_errors=True)
     # One budget covers both attempts: the RQ job timeout is sized for one
     # MrBayes run, so a +I+G retry gets what the first run left, not a fresh one.
     budget = _tool_timeout_seconds(config, "MrBayes")
     started = time.monotonic()
     while True:
-        _write_mrbayes_input(rates)
+        _write_mrbayes_input(rates, resume=resume,
+                             run_ngen=continuation_ngen if resume else None)
         nan_seen = False
         stats: Optional[Dict[str, Any]] = None
-        remaining = max(1, int(budget - (time.monotonic() - started)))
+        attempt_started = time.monotonic()
+        remaining = max(1, int(budget - (attempt_started - started)))
 
         if job_id:
             # Publish command line (displayed in green)
@@ -1895,7 +2040,86 @@ def _run_mrbayes(
             nan_seen = MRBAYES_NAN_MARKER in (stdout or "")
 
         if exit_code == 0:
+            if stop_early and not resume:
+                diagnostics = _read_mrbayes_convergence(nexus_input, task_logger, log_result=False)
+                completed = diagnostics.get("mcmc_generations_completed")
+                from app.services.artifact_storage import artifact_exists
+                if (diagnostics.get("converged") is False
+                        and completed and ngen - completed >= samplefreq
+                        and artifact_exists(Path(f"{nexus_input}.ckp"))):
+                    # ASDSF alone may stop with almost no effective samples.
+                    # Continue ONCE, from the existing chains, with the split
+                    # stop rule off -- for a bounded number of generations
+                    # (see _mrbayes_continuation_target), never to the full
+                    # ceiling, which can be ~50x the work already done.
+                    now = time.monotonic()
+                    seconds_per_generation = (now - attempt_started) / completed
+                    left = budget - (now - started)
+                    target, limited_by = _mrbayes_continuation_target(
+                        completed, ngen, samplefreq, diagnostics.get("min_ess"),
+                        seconds_per_generation, left,
+                    )
+                    continuation = {
+                        "from_generation": completed,
+                        "initial_stopval": stopval,
+                        "reason": "; ".join(diagnostics.get("convergence_warnings", [])),
+                        "limited_by": limited_by,
+                    }
+                    if target is not None:
+                        segment_backup = _snapshot_mrbayes_run(nexus_input)
+                    if segment_backup is not None:
+                        continuation_ngen = target
+                        estimated = int(seconds_per_generation * (target - completed))
+                        continuation.update({
+                            "outcome": "continued", "to_generation": target,
+                            "estimated_seconds": estimated,
+                        })
+                        task_logger.info(
+                            "event=mrbayes.early_stop_continued from_generation=%s "
+                            "to_generation=%s limited_by=%s estimated_seconds=%d "
+                            "remaining_seconds=%d reason=%s",
+                            completed, target, limited_by, estimated, left,
+                            continuation["reason"],
+                        )
+                        resume = True
+                        continue
+                    continuation["outcome"] = "not_continued"
+                    continuation["not_continued_because"] = (
+                        "the first segment could not be saved aside"
+                        if target is not None else
+                        f"the {limited_by.replace('_', ' ')} bound left too short an "
+                        "extension to change the diagnostics"
+                    )
+                    task_logger.info(
+                        "event=mrbayes.early_stop_not_continued from_generation=%s "
+                        "limited_by=%s remaining_seconds=%d",
+                        completed, limited_by, left,
+                    )
+            if segment_backup is not None:
+                shutil.rmtree(segment_backup, ignore_errors=True)
+                segment_backup = None
             break
+
+        if resume and segment_backup is not None:
+            # The continuation failed (time limit, a rejected checkpoint, a NaN
+            # mid-chain...). The first segment had already finished with a
+            # consensus tree, so that result is returned rather than failing a
+            # job that used to succeed with a convergence warning.
+            restored = _restore_mrbayes_run(nexus_input, segment_backup)
+            segment_backup = None
+            if restored:
+                from app.services.log_context import log_degradation
+
+                log_degradation(
+                    task_logger, "mrbayes_continuation_failed",
+                    "The MrBayes continuation past the early stop failed; using "
+                    "the tree from the first segment",
+                    exit_code=exit_code, from_generation=continuation["from_generation"],
+                )
+                continuation["outcome"] = "failed"
+                continuation["exit_code"] = exit_code
+                resume = False
+                break
 
         # Retry only a gamma-only run, only once, and only when the failed
         # attempt left at least half the MrBayes budget. Measured here rather
@@ -1917,6 +2141,8 @@ def _run_mrbayes(
                 "reason": "MrBayes aborted with a NaN log likelihood under +G rates",
             }
             rates, effective_model = "invgamma", fallback_model
+            resume = False
+            continuation = None
             if job_id:
                 notice = _make_log_callback(job_id, "tree", "stdout")
                 if notice:
@@ -1971,11 +2197,15 @@ def _run_mrbayes(
         "mcmc_nchains": nchains,
         "mcmc_burnin_fraction": burnin_fraction,
         "mcmc_stop_early_requested": stop_early_requested,
+        # The stop rule was in effect for the (first) segment; a continuation
+        # past it is described by mrbayes_early_stop_continuation.
         "mcmc_stoprule": stop_early,
         "seed": seed,
     }
     if rate_fallback:
         metadata["mrbayes_rate_fallback"] = rate_fallback
+    if continuation:
+        metadata["mrbayes_early_stop_continuation"] = continuation
     if stop_early:
         metadata["mcmc_stopval"] = stopval
     metadata.update(_read_mrbayes_convergence(nexus_input, task_logger))
@@ -1984,7 +2214,10 @@ def _run_mrbayes(
     # generation is the only reliable record of that; a full-length run always
     # samples within one samplefreq of ngen, so a larger gap can only mean
     # MrBayes stopped itself. Left absent rather than guessed when the
-    # generation count could not be read.
+    # generation count could not be read. A continuation is capped well below
+    # ngen, so a continued run normally still reads True here: it ended early
+    # because the stop rule fired, and mrbayes_early_stop_continuation records
+    # how far the bounded extension then ran (from_generation -> to_generation).
     completed = metadata.get("mcmc_generations_completed")
     if stop_early and isinstance(completed, int):
         metadata["mcmc_stopped_at_stopval"] = (ngen - completed) >= samplefreq

@@ -67,6 +67,26 @@ def validate_job_id(job_id: str) -> bool:
         return False
     return bool(JOB_ID_PATTERN.fullmatch(job_id) or SHORT_JOB_ID_PATTERN.fullmatch(job_id))
 
+
+def repair_job_id_multiplication_sign(job_id: str) -> Optional[str]:
+    """Return the canonical ID for a safe ``x``/``×`` transcription error.
+
+    Phones and formatted messages sometimes replace the ASCII ``x`` in a short
+    base36 job ID with the typographic multiplication sign.  Repair only that
+    character, and only when the complete repaired value passes the ordinary
+    job-ID validator.  Keeping this separate from ``validate_job_id`` means an
+    invalid path never becomes valid implicitly inside a filesystem lookup.
+    """
+    if not isinstance(job_id, str):
+        return None
+    # Gunicorn/WSGI can expose the UTF-8 bytes for × through PATH_INFO's
+    # Latin-1 boundary as ``Ã\x97``. Accept that transport representation as
+    # the same typo; the final validator remains the safety boundary.
+    candidate = job_id.replace("×", "x").replace("Ã\x97", "x")
+    if candidate == job_id or not validate_job_id(candidate):
+        return None
+    return candidate
+
 def cap_fasta_header(header: str) -> str:
     """Strip control characters from a FASTA header and cap it to a sane length.
 

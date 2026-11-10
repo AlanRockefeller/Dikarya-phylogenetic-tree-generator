@@ -5,6 +5,7 @@ user-visible symptom when it breaks: the worker kept running perfectly while its
 log went silent, and the digest kept printing while its numbers were wrong.
 """
 
+import collections
 import gzip
 import importlib.util
 import json
@@ -1082,9 +1083,9 @@ class HealthTransitionTests(unittest.TestCase):
         assert sum("recovered" in message for message in messages) == 1
 
     def test_disk_uses_hysteresis_so_a_flapping_value_does_not_spam(self):
-        with patch.object(self.services, "get_worker_status", return_value={"workers": [
-            {"status": "healthy"}
-        ]}), patch.object(self.services, "db", Mock()), patch.object(self.services, "Job", Mock()):
+        with patch.object(self.services, "_emit_worker_health"), \
+                patch.object(self.services, "db", Mock()), \
+                patch.object(self.services, "Job", Mock()):
             self.services.emit_health_transitions({"disk_usage": 91, "memory_percent": 10})
             # 87 is below the 90 entry threshold but above the 85 exit threshold:
             # still unhealthy, and therefore not a new transition.
@@ -1179,6 +1180,28 @@ def test_digest_reads_rotations_deduplicates_mirrors_and_groups_final_cause(tmp_
     assert sorted(result["coverage"]["files"]) == ["error.log-20260814.gz", "errors.log"]
 
 
+def test_digest_renders_every_error_group_and_orders_by_severity():
+    digest = _digest_module()
+    warning_keys = [f"warning {index}" for index in range(12)]
+    errors = {
+        "exceptions": collections.Counter(
+            {**{key: 1 for key in warning_keys}, "rare serious failure": 1}
+        ),
+        "exception_levels": {
+            **{key: "WARNING" for key in warning_keys},
+            "rare serious failure": "ERROR",
+        },
+        "affected": {},
+        "affected_jobs": {},
+    }
+
+    rendered = digest.format_exception_rows(errors)
+
+    assert len(rendered) == 13
+    assert "[ERROR] rare serious failure" in rendered[0]
+    assert all(any(key in row for row in rendered) for key in warning_keys)
+
+
 def test_digest_separates_5xx_noise_and_streams_and_normalizes_thumb(tmp_path):
     digest = _digest_module()
     digest.LOG_DIR = tmp_path
@@ -1193,7 +1216,7 @@ def test_digest_separates_5xx_noise_and_streams_and_normalizes_thumb(tmp_path):
 
     result = digest.analyze_access(datetime.now() - timedelta(hours=1))
 
-    assert result["server_errors"][(500, "GET /api/job/abc")] == 1
+    assert result["server_errors"][(500, "GET /api/job/<id>")] == 1
     assert result["product_4xx"][(422, "POST /api/job")] == 1
     assert result["noise_4xx"][(404, "GET /thumb/<id>.jpg")] == 1
     assert "GET /api/job/<id>/events" in result["streams"]

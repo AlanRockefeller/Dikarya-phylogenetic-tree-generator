@@ -340,6 +340,49 @@ test('nonlocal and non-MycoMap tips do not get a MycoMap sequence link', () => {
     ), null);
 });
 
+test('MycoMap resolver links preserve the original tip while provenance matching is normalized', () => {
+    const label = 'iNat393666515 Lepiota Greenville Ohio US RiC 44';
+    for (const original of ['_R_' + label, label.replaceAll(' ', '  ')]) {
+        const target = P.extractMycomapSequenceTarget(
+            { data: { __original_name: original, name: 'Renamed tip' } },
+            [{ fasta_header: label, source: 'mycomap', hit_source: 'local' }],
+            'zszo'
+        );
+        assert.ok(target);
+        assert.strictEqual(target.urls.primary,
+            '/api/job/zszo/tree/mycomap-sequence?tip_name=' + encodeURIComponent(original));
+    }
+});
+
+test('a UNITE accession opens UNITE, not GenBank', () => {
+    // Spread into this realm: arrays built inside the bundle's vm context are
+    // never deepStrictEqual to local ones.
+    const kinds = label => [...P.extractRecordTargets({ data: { name: label } })]
+        .map(target => `${target.kind}:${target.id}`);
+    assert.deepStrictEqual(kinds('UDB0799647 Entoloma undulatosporum'), ['unite:UDB0799647']);
+    const [unite] = P.extractRecordTargets({ data: { name: 'UDB037377 Russula turci' } });
+    assert.strictEqual(unite.urls.primary, 'https://unite.ut.ee/bl_forw.php?nimi=UDB037377');
+    // Ordinary accessions are unchanged.
+    assert.deepStrictEqual(kinds('KM248898 Hygrocybe cf minutula'), ['genbank:KM248898']);
+    assert.deepStrictEqual(kinds('ABCD01000123 Russula'), ['genbank:ABCD01000123']);
+});
+
+test('a curator record names its MycoMap dataset and drops a link that cannot resolve', () => {
+    const label = 'MycoMap#df-47-66-18048 Russula 38 SAT 13-286-04';
+    const record = { name: label, source: 'mycomap', hit_source: 'local',
+        mycomap_record_id: 'df-47-66-18048', mycomap_dataset: 'Danny Miller WC Annotations' };
+    const node = { data: { name: label } };
+    assert.strictEqual(P.mycomapRecordSourceText(node, [record]),
+        'MycoMap dataset: Danny Miller WC Annotations');
+    assert.strictEqual(P.mycomapRecordSourceText(node, [{ ...record, mycomap_dataset: '' }]), '');
+    // No public page for a df- record and no observation to find it by.
+    assert.strictEqual(P.extractMycomapSequenceTarget(node, [record], 'zszo'), null);
+    // An observation in the label lets the resolver find it.
+    const observed = 'iNat162755648 Galerina smithii';
+    assert.ok(P.extractMycomapSequenceTarget({ data: { name: observed } },
+        [{ ...record, name: observed }], 'zszo'));
+});
+
 test('a directly imported MycoMap sequence record gets the same link', () => {
     const label = 'iNat393666515 Lepiota';
     assert.ok(P.extractMycomapSequenceTarget(

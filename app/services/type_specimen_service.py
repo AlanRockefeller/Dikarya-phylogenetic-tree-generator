@@ -1,10 +1,22 @@
 """Which tree tips are type specimens, and what kind.
 
-Two sources, merged per accession:
+Three sources, merged per accession:
 
 * **MycoMap's type-specimen list** (``https://mycomap.org/api/type-specimens``),
   snapshotted into ``mycomap_type_specimens.json`` by
   ``scripts/dikarya_refresh_type_specimens.py``. Read-only here.
+* **MycoMap.org's curation flag** (``POST /api/mycoblast/genbank-curation``,
+  ``isType``). A curator can designate a GenBank record a type on MycoMap.org
+  (``typeBasis: "manual"``) without it ever reaching the list above -- OP739129,
+  the Podaxis inyoensis holotype that GenBank files as P. pistillaris, is one.
+  ``mycomap_org_service.curated_genbank_rows()`` hands every answer it gets to
+  ``remember_mycomap_curation()``, which appends to
+  ``mycomap_curation_types.jsonl``; the refresh script re-asks about recent
+  jobs' accessions weekly, because a curator can set or clear the flag at any
+  time. Only a positive flag with a trusted ``typeBasis`` marks a tip (see
+  ``TRUSTED_CURATION_BASES``): ``isType: false`` means "not designated on
+  MycoMap", not "not a type" (GenBank holotypes answer false), and the
+  ``source`` basis is a keyword match that flags "RFLP type 52".
 * **GenBank's own annotation**: the ``/type_material`` source qualifier, or
   RefSeq's "from TYPE material" DEFINITION marker. ``_parse_genbank_xml()``
   hands every record it parses to ``remember_genbank_records()``, which appends
@@ -21,7 +33,7 @@ label is never taken for the GenBank accession of the same shape.
 
 Everything here is display metadata. Nothing is written into a job directory,
 so tree state, undo and recompute are unaffected, and an old job picks up type
-markers as soon as either source learns about one of its accessions.
+markers as soon as any source learns about one of its accessions.
 """
 from __future__ import annotations
 
@@ -45,6 +57,21 @@ DATA_DIR = Path(Config.TYPE_SPECIMEN_DIR)
 MYCOMAP_SNAPSHOT_NAME = "mycomap_type_specimens.json"
 BUNDLED_MYCOMAP_PATH = Config.BASE_DIR / "mycomap-type-specimens.json"
 GENBANK_CACHE_NAME = "genbank_type_material.jsonl"
+CURATION_CACHE_NAME = "mycomap_curation_types.jsonl"
+# genbank-curation's typeBasis says why MycoMap.org calls a record a type
+# (first match wins), and only these are trusted. "manual" is a curator's
+# designation (OP739129), "refseq" an NR_ record not "from reference/verified
+# material", "type_material" NCBI's own /type_material qualifier (added by
+# MycoMap.org PR #18; 0/30 false in its audit), "mycomap" MycoMap's stored
+# flag. Not yet: "title" (a type named in the DEFINITION line) and "source" (a
+# note, voucher or strain). "source" was a bare match on the word "type" and
+# was wrong for every one checked on 2026-11-08 -- "RFLP type 52", "its type
+# b", "type: OTU: KGP46", "study type", three on uncultured fungi. PR #18
+# rewrites both with type-word rules (0/30 false in its audit); add them here
+# once that is deployed AND its recheck has been applied to .org's
+# genbank_curation table, because until then .org still serves the old flags.
+# An unknown basis is not trusted until someone has looked at what it matches.
+TRUSTED_CURATION_BASES = frozenset({"manual", "refseq", "type_material", "mycomap"})
 # scripts/dikarya_refresh_type_specimens.py appends its statistics and one
 # event=type_specimens.* line per type accession it adds, drops or reclassifies
 # here, and scripts/dikarya_log_digest.py reports them. Keep the default in
@@ -231,11 +258,27 @@ def genbank_index() -> Dict[str, Dict[str, Any]]:
     return _cached_load(GENBANK_CACHE_NAME, _load_genbank)
 
 
+def curation_index() -> Dict[str, Dict[str, Any]]:
+    """MycoMap.org curation answers, latest per accession (same format as GenBank's)."""
+    return _cached_load(CURATION_CACHE_NAME, _load_genbank)
+
+
+def curation_marks(entry: Optional[Dict[str, Any]]) -> bool:
+    """True when a recorded curation answer should mark its tip as a type.
+
+    Checked when read rather than only when written, so narrowing
+    TRUSTED_CURATION_BASES takes effect on entries already in the file.
+    """
+    return bool(entry and entry.get("status")
+                and entry.get("type_basis") in TRUSTED_CURATION_BASES)
+
+
 def lookup(accession: Any, genbank_types: Optional[Dict[str, Any]] = None,
-           mycomap_types: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+           mycomap_types: Optional[Dict[str, Any]] = None,
+           curation_types: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Merged type information for one accession, or None if it is not a type.
 
-    A caller resolving many accessions passes both indexes in, so each file is
+    A caller resolving many accessions passes the indexes in, so each file is
     checked for changes once rather than once per accession.
     """
     acc = accession_root(accession)
@@ -245,7 +288,10 @@ def lookup(accession: Any, genbank_types: Optional[Dict[str, Any]] = None,
     if genbank and not genbank.get("status"):
         genbank = None  # a recorded "fetched, not a type" answer
     mycomap = (mycomap_index() if mycomap_types is None else mycomap_types).get(acc)
-    if not genbank and not mycomap:
+    curation = (curation_index() if curation_types is None else curation_types).get(acc)
+    if not curation_marks(curation):
+        curation = None  # cleared since, or a basis that is not trusted
+    if not genbank and not mycomap and not curation:
         return None
 
     sources = []
@@ -256,18 +302,23 @@ def lookup(accession: Any, genbank_types: Optional[Dict[str, Any]] = None,
         sources.append("genbank" if genbank.get("type_material") else "genbank_definition")
     if mycomap:
         sources.append("mycomap")
-    first = lambda field: next(  # noqa: E731
-        (str(rec.get(field)).strip() for rec in (genbank, mycomap)
-         if rec and str(rec.get(field) or "").strip()),
-        "",
-    )
-    status = (genbank or {}).get("status") or (mycomap or {}).get("status") or "type"
+    if curation:
+        sources.append("mycomap_curation")
+
+    def first(field, order):
+        return next((str(rec.get(field)).strip() for rec in order
+                     if rec and str(rec.get(field) or "").strip()), "")
+
+    status = ((genbank or {}).get("status") or (mycomap or {}).get("status")
+              or (curation or {}).get("status") or "type")
     return {
         "accession": acc,
         "status": status,
-        "type_material": first("type_material"),
-        "organism": first("organism"),
-        "voucher": first("voucher"),
+        "type_material": first("type_material", (genbank, mycomap)),
+        # MycoMap's curated name outranks GenBank's: the curators correct
+        # misidentified GenBank records there, and GenBank cannot be corrected.
+        "organism": first("organism", (curation, genbank, mycomap)),
+        "voucher": first("voucher", (genbank, mycomap)),
         "sources": sources,
     }
 
@@ -301,9 +352,9 @@ def genbank_type_entry(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _append_entries(entries) -> None:
+def _append_entries(entries, name: str = GENBANK_CACHE_NAME) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    path = DATA_DIR / GENBANK_CACHE_NAME
+    path = DATA_DIR / name
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     payload = "".join(
         json.dumps({**entry, "recorded": stamp}, ensure_ascii=False, sort_keys=True) + "\n"
@@ -373,6 +424,45 @@ def remember_genbank_records(records: Iterable[Dict[str, Any]], include_negative
         return 0
 
 
+def remember_mycomap_curation(rows: Dict[str, Any]) -> int:
+    """Record MycoMap.org's ``isType`` answers; returns lines written.
+
+    ``rows`` is ``{ACCESSION: genbank-curation result row}``. A trusted
+    positive flag (``TRUSTED_CURATION_BASES``) is written when it is new or its
+    name changed, and anything else only when it clears a flag recorded earlier
+    (later lines win), so the file holds the designations rather than one line
+    per accession ever asked about. Called on every curation lookup, so it must
+    never raise.
+    """
+    try:
+        known = curation_index()
+        new_entries = []
+        for key, row in (rows or {}).items():
+            acc = accession_root(key)
+            if not acc or not isinstance(row, dict) or not isinstance(row.get("isType"), bool):
+                continue
+            previous = known.get(acc) or {}
+            basis = " ".join(str(row.get("typeBasis") or "").split())
+            if row["isType"] and basis in TRUSTED_CURATION_BASES:
+                entry = {
+                    "accession": acc,
+                    "status": "type",
+                    "organism": " ".join(str(row.get("scientificName") or "").split()),
+                    "type_basis": basis,
+                }
+                if all(previous.get(k) == entry[k] for k in ("status", "organism", "type_basis")):
+                    continue
+                new_entries.append(entry)
+            elif previous.get("status"):
+                new_entries.append({"accession": acc, "status": None})
+        if new_entries:
+            _append_entries(new_entries, CURATION_CACHE_NAME)
+        return len(new_entries)
+    except Exception as exc:  # display metadata must never break a fetch
+        logger.warning("event=type_specimens.curation_record_failed error=%s", exc)
+        return 0
+
+
 # --------------------------------------------------------------------------
 # Per-job resolution
 # --------------------------------------------------------------------------
@@ -421,12 +511,13 @@ def type_specimens_for_job(job_dir: Path, sequence_metadata: Any = None) -> Dict
 
     genbank_types = genbank_index()
     mycomap_types = mycomap_index()
+    curation_types = curation_index()
     for header in headers:
         metadata = metadata_by_name.get(header) or {}
         acc = accession_root(record_accession(header, metadata))
         if not acc:
             continue
-        info = records.get(acc) or lookup(acc, genbank_types, mycomap_types)
+        info = records.get(acc) or lookup(acc, genbank_types, mycomap_types, curation_types)
         if info is None and FROM_TYPE_MATERIAL_RE.search(str(metadata.get("raw_ncbi_description") or "")):
             # MycoMap BLAST imports keep NCBI's DEFINITION line, which carries
             # RefSeq's marker even for a job whose accession was never fetched.
