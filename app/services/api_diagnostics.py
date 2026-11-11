@@ -31,6 +31,10 @@ _HEADERS = {"content-type", "content-length", "date", "retry-after", "x-request-
             "cf-ray", "server"}
 
 
+# Date folders already reported as not group-shared by this process.
+_UNSHARED_REPORTED = set()
+
+
 def _archive_directory(now):
     """Share date folders between CLI captures and the web/worker account."""
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,13 +46,39 @@ def _archive_directory(now):
         # archive's shared group explicitly even when its parent lacks setgid.
         # Best effort: the workers run with RestrictSUIDSGID=yes, which refuses
         # the setgid chmod with EPERM, and that must not cost the archive itself.
+        #
+        # Alan 11/11/26 - The chown and the chmod used to share one try, so a
+        # refused chown (a process without the dikarya group, e.g. an agent
+        # sandbox) skipped the g+rwx too, and nothing said so: 2026-11-08 was
+        # created tree:tree and every web/worker archive that day failed with
+        # PermissionError. The real fix is setgid on ARCHIVE_DIR, which makes
+        # the kernel assign the shared group at mkdir; this is the backstop,
+        # and the warning names the day that will not be shared.
+        shared_gid = None
         try:
             shared_gid = ARCHIVE_DIR.stat().st_gid
             if info.st_gid != shared_gid:
                 os.chown(directory, -1, shared_gid)
+        except OSError:
+            pass
+        try:
             mode = stat.S_IMODE(info.st_mode) | stat.S_ISGID | stat.S_IRWXG
             if mode != stat.S_IMODE(info.st_mode):
                 directory.chmod(mode)
+        except OSError:
+            pass
+        try:
+            if (shared_gid is not None and directory.stat().st_gid != shared_gid
+                    and directory.name not in _UNSHARED_REPORTED):
+                # Once per folder per process: every later archive that day
+                # would otherwise repeat the same WARNING into errors.log.
+                _UNSHARED_REPORTED.add(directory.name)
+                logger.warning(
+                    "event=api.archive_group_unshared directory=%s gid=%s expected_gid=%s "
+                    "(other accounts cannot write this day's archives; "
+                    "run chmod g+s on %s)",
+                    directory.name, directory.stat().st_gid, shared_gid, ARCHIVE_DIR,
+                )
         except OSError:
             pass
     return directory

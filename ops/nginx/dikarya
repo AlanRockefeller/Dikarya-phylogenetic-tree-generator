@@ -151,6 +151,21 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 300;
+        # 2026-11-11: the defaults (8 x 4k/8k response, 8k/16k request body)
+        # spilled ~700 responses and request bodies a week to
+        # /var/lib/nginx/{proxy,body}. /tree is ~400 KB and the viewer ~300 KB
+        # uncompressed, and POST /api/job carries the whole FASTA. 512 KB of
+        # response buffer covers every page; larger downloads still spill, as
+        # they should. The proxy_buffers are ceilings, allocated as used.
+        # client_body_buffer_size is NOT: nginx allocates
+        # min(client_body_buffer_size, Content-Length) in one go when it starts
+        # reading a body, so a large value lets slow clients that merely
+        # declare a big body reserve that much each. 128k keeps typical FASTA
+        # submissions in memory and sends the rare larger one to disk.
+        proxy_buffer_size 16k;
+        proxy_buffers 16 32k;
+        proxy_busy_buffers_size 64k;
+        client_body_buffer_size 128k;
     }
 
     location /static/ {

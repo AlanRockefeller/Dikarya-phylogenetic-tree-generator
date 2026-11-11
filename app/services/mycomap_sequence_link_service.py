@@ -80,32 +80,44 @@ def _original_tip_name(state, requested):
     return matches[0]
 
 
-def _metadata_for_tip(job_info, original_name):
+def find_sequence_metadata_row(sequence_metadata, original_name, *,
+                               allow_token_match=True):
+    """The one sequence_metadata row for a tree tip, or None when not unique.
+
+    Exact fasta_header/name first, then the same names with MAFFT's ``_R_``
+    prefix stripped and whitespace collapsed, then (optionally) the first
+    token alone. Shared by the MycoMap source link and the label refresh.
+    """
     exact = []
     normalized_matches = []
     token_matches = []
     normalized = _normalize_tip_label(original_name)
     wanted_token = normalized.split(None, 1)[0] if normalized else ""
-    for row in job_info.get("sequence_metadata") or []:
+    for row in sequence_metadata or []:
         if not isinstance(row, dict):
             continue
         names = {
             str(row.get("fasta_header") or "").strip(),
             str(row.get("name") or "").strip(),
         }
+        names.discard("")
         if original_name in names:
             exact.append(row)
-        elif normalized in {_normalize_tip_label(name) for name in names}:
+        elif normalized and normalized in {_normalize_tip_label(name) for name in names}:
             normalized_matches.append(row)
-        elif wanted_token and any(
+        elif allow_token_match and wanted_token and any(
             _normalize_tip_label(name).split(None, 1)[0] == wanted_token
             for name in names if _normalize_tip_label(name)
         ):
             token_matches.append(row)
     matches = exact or normalized_matches or token_matches
-    if len(matches) != 1:
+    return matches[0] if len(matches) == 1 else None
+
+
+def _metadata_for_tip(job_info, original_name):
+    row = find_sequence_metadata_row(job_info.get("sequence_metadata"), original_name)
+    if row is None:
         raise MycoMapSequenceLinkError("No unique MycoMap source record was saved for this tip.")
-    row = matches[0]
     if (str(row.get("source") or "").lower() != "mycomap"
             or str(row.get("hit_source") or "").lower() not in {"local", "sequence_record"}):
         raise MycoMapSequenceLinkError("This tip is not a MycoMap sequence record.", 422)

@@ -11,6 +11,115 @@
 
 {% block head %}
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/viewer-fonts.css') }}">
+{# Reserve the scrollbar's space from the start. The tree is fitted to the pane's width,
+   so a scrollbar appearing once the tall tree had drawn narrowed the pane and set off a
+   second layout (the pane ResizeObserver) a moment after the first. #}
+<style>html { scrollbar-gutter: stable; }</style>
+{# Alan 11/11/26 - Opt-in load diagnostics: /job/<id>/view?layout_trace=1 records, for the
+   first 5 s, every change to the tip labels' and annotations' screen position plus the
+   viewer's layout calls, then shows the log to copy. Off unless the parameter is present,
+   and only emitted then, so ordinary viewer pages do not carry it. #}
+{% if request is defined and request.args.get('layout_trace') == '1' %}
+<script>
+(function () {
+    if (!/[?&]layout_trace=1\b/.test(location.search)) return;
+    var t0 = performance.now(), log = [], last = '';
+    var ms = function () { return Math.round(performance.now() - t0); };
+    function geometry() {
+        var c = document.getElementById('tree-container');
+        if (!c) return null;
+        var tipRight = null, font = '', annRight = null, el = null;
+        c.querySelectorAll('g.node text').forEach(function (t) {
+            var r = t.getBoundingClientRect();
+            if (r.width && (tipRight === null || r.right > tipRight)) { tipRight = r.right; el = t; }
+        });
+        if (el) font = (el.style.fontSize || '') + ' dx=' + el.getAttribute('dx');
+        c.querySelectorAll('g.clade-annotations').forEach(function (a) {
+            var r = a.getBoundingClientRect();
+            if (r.width) annRight = Math.max(annRight === null ? -1e9 : annRight, r.right);
+        });
+        return { tipRight: tipRight && Math.round(tipRight), font: font,
+                 annRight: annRight && Math.round(annRight),
+                 top: Math.round(c.getBoundingClientRect().top), paneW: c.clientWidth };
+    }
+    function frame() {
+        var g = geometry();
+        var key = JSON.stringify(g);
+        if (g && key !== last) { last = key; log.push(ms() + 'ms PAINT ' + key); }
+        if (performance.now() - t0 < 5000) requestAnimationFrame(frame); else show();
+    }
+    requestAnimationFrame(frame);
+    (function hook() {
+        var C = window.DikaryaTreeViewer;
+        if (!C) return setTimeout(hook, 1);
+        ['render', '_draw', '_relayoutHorizontal', '_settleFittedWidth', '_runFitCheck', 'settleLayoutNow',
+         'applyRenames', 'setHorizontalPercent', 'setSpacingState', 'setTipLabelGap', 'applyTextSizing',
+         '_addSupportLabels', '_renderCladeAnnotations', 'setCladeAnnotations', 'restoreSelectionSets',
+         'setFocalTip', 'setSortMode', 'setLayout', 'collapseNode', 'toggleSupport'].forEach(function (n) {
+            var orig = C.prototype[n];
+            if (typeof orig !== 'function') return;
+            C.prototype[n] = function () {
+                var r = orig.apply(this, arguments);
+                if (performance.now() - t0 < 5000) {
+                    var bw = this.tree && this.tree.display && this.tree.display.options
+                        ? Math.round(this.tree.display.options['branch-width']) : '-';
+                    log.push(ms() + 'ms ' + n + ' bw=' + bw);
+                }
+                if (n === '_draw') traceDisplay(this);
+                return r;
+            };
+        });
+    })();
+    // Alan 11/11/26 - Name the phylotree call that changes the tip-label font, with a short stack.
+    function tipFont() {
+        var t = document.querySelector('#tree-container g.node text');
+        return t ? (t.style.fontSize + ' dx=' + t.getAttribute('dx')) : '-';
+    }
+    function traceDisplay(viewer) {
+        var d = viewer && viewer.tree && viewer.tree.display;
+        if (!d || d.__layoutTraced) return;
+        d.__layoutTraced = true;
+        log.push(ms() + 'ms display created; per-label sizing=' + (typeof viewer._sizeTipLabel === 'function'));
+        ['update', 'refresh', 'placenodes', 'resizeSvg', 'modifySelection', 'updateHasHiddenNodes',
+         'redraw', 'layout', 'spacing_x', 'spacing_y'].forEach(function (m) {
+            var f = d[m];
+            if (typeof f !== 'function') return;
+            d[m] = function () {
+                var before = tipFont();
+                var res = f.apply(this, arguments);
+                var after = tipFont();
+                if (before !== after && performance.now() - t0 < 5000) {
+                    var stack = String(new Error().stack || '').split('\n').slice(1, 7)
+                        .map(function (s) { return s.replace(/https?:\/\/[^/]+/g, '').slice(0, 120); }).join(' | ');
+                    log.push(ms() + 'ms display.' + m + ': ' + before + ' -> ' + after + ' @ ' + stack);
+                }
+                return res;
+            };
+        });
+    }
+    function show() {
+        var prefs = {};
+        try {
+            for (var i = 0; i < localStorage.length; i++) {
+                var k = localStorage.key(i);
+                if (/tree|viewer|theme/i.test(k)) prefs[k] = String(localStorage.getItem(k)).slice(0, 300);
+            }
+        } catch (e) {}
+        var scripts = Array.prototype.map.call(document.querySelectorAll('script[src*="tree_viewer"]'),
+            function (s) { return s.getAttribute('src').replace(/^.*\//, ''); });
+        var text = JSON.stringify({ scripts: scripts, ua: navigator.userAgent, viewport: [innerWidth, innerHeight],
+            dpr: devicePixelRatio, viewOnly: !!window.VIEW_ONLY, prefs: prefs, log: log }, null, 1);
+        var box = document.createElement('textarea');
+        box.value = text;
+        box.readOnly = true;
+        box.style.cssText = 'position:fixed;right:12px;bottom:12px;width:520px;height:320px;z-index:99999;font:11px monospace;background:#fff;color:#000;border:2px solid #c90;';
+        document.body.appendChild(box);
+        box.focus();
+        box.select();
+    }
+})();
+</script>
+{% endif %}
 {% if social is defined %}
 <link rel="canonical" href="{{ social.url }}">
 <meta property="og:type" content="website">
@@ -264,7 +373,7 @@
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">D</kbd></dt>
                     <dd>Deselect all sequences</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd></dt>
-                    <dd>Annotate the selected sequences with their most common species (or genus) name, without opening the editor. Opens the editor instead if no name can be found.</dd>
+                    <dd>Annotate the selected sequences with their most common species (or genus) name, without opening the editor. Opens the editor instead if no name can be found, or if the selection is not one clade (so a stray selected tip elsewhere is not swept in).</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Shift</kbd>&nbsp;+&nbsp;<kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd></dt>
                     <dd>Same as <kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd>, but adds <em>cf.</em> after the genus (<em>Inocybe geophylla</em> becomes <em>Inocybe cf. geophylla</em>)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">A</kbd></dt>
@@ -635,10 +744,15 @@
                         themselves. Treat it as a second opinion, not a determination.
                     </p>
                     <div class="flex gap-3">
+                        {# A re-run skips the cache and spends the site-wide daily
+                           allowance, so the server only accepts it with edit
+                           access; view-only visitors get the cached review. #}
+                        {% if not view_only %}
                         <button type="button" id="btn-claude-review-refresh"
                             class="px-4 py-2 text-sm font-semibold rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors flex items-center gap-2">
                             <i class="fas fa-rotate"></i> Re-run
                         </button>
+                        {% endif %}
                         <button type="button" id="btn-claude-review-done"
                             class="px-4 py-2 text-sm font-semibold rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark transition-colors shadow-sm">
                             Done
@@ -1620,11 +1734,11 @@
 
 <script data-viewer-critical="true" src="{{ url_for('static', filename='js/phylotree.js') }}?v=20"></script>
 
-<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=118"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=123"></script>
 
 <script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=9"></script>
 
-<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=114"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=120"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

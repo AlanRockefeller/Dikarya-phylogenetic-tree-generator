@@ -2798,29 +2798,25 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str, *,
 
 def _remember_reconciled_sequence_metadata(job_dir, records) -> int:
     """Add missing provenance after an append, including on a retry."""
-    from app.services.artifact_storage import default_file_mode
+    from app.services.artifact_storage import open_artifact, write_json_atomic
+    from app.services.tree_edit_service import tree_state_lock
 
     if not records:
         return 0
     info_path = job_dir / "input_info.json"
-    stored = json.loads(info_path.read_text())
-    metadata = list(stored.get("sequence_metadata") or [])
-    known = {item.get("fasta_header") for item in metadata if isinstance(item, dict)}
-    additions = [item for item in _build_sequence_metadata(records)
-                 if item["fasta_header"] not in known]
-    if not additions:
-        return 0
-    stored["sequence_metadata"] = metadata + additions
-    mode = (info_path.stat().st_mode & 0o777) if info_path.exists() else default_file_mode()
-    fd, temp_path = tempfile.mkstemp(dir=info_path.parent, prefix="input_info.")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(stored, handle, separators=(",", ":"))
-        os.chmod(temp_path, mode)
-        os.replace(temp_path, info_path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
+    # The viewer's MycoMap refresh rewrites sequence_metadata under this same
+    # lock; without it one read-modify-write would erase the other's change.
+    with tree_state_lock(job_dir):
+        with open_artifact(info_path, "rt") as handle:
+            stored = json.load(handle)
+        metadata = list(stored.get("sequence_metadata") or [])
+        known = {item.get("fasta_header") for item in metadata if isinstance(item, dict)}
+        additions = [item for item in _build_sequence_metadata(records)
+                     if item["fasta_header"] not in known]
+        if not additions:
+            return 0
+        stored["sequence_metadata"] = metadata + additions
+        write_json_atomic(info_path, stored)
     return len(additions)
 
 

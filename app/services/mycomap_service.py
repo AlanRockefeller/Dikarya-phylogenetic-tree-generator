@@ -125,6 +125,14 @@ class MycoMapRefreshError(Exception):
     """Raised when MycoMap observation records cannot be refreshed or resolved."""
 
 
+class MycoMapRefreshRateLimited(MycoMapRefreshError):
+    """MycoMap.org's refresh limit was reached; retry after ``retry_after`` s."""
+
+    def __init__(self, message, retry_after=60):
+        super().__init__(message)
+        self.retry_after = max(1, int(retry_after or 60))
+
+
 class MycoMapRefreshTimeout(MycoMapRefreshError):
     """A MycoMap refresh-API request ran out of time (MycoMap slow or down)."""
 
@@ -2201,17 +2209,21 @@ def refresh_mycomap_observation_records(references: list) -> dict:
 
     try:
         before = org.observation_records(normalized)
-        warnings = org.refresh_observations(normalized)
+        not_refreshed = []
+        warnings = org.refresh_observations(normalized, not_refreshed=not_refreshed)
         # MycoMap.org's own button waits briefly before re-reading too.
         time.sleep(1)
         after = org.observation_records(normalized)
     except org.OrgResultError as exc:
+        if exc.status == 429:
+            raise MycoMapRefreshRateLimited(str(exc), exc.retry_after) from exc
         raise MycoMapRefreshError(str(exc)) from exc
     return {
         "references": normalized,
         "before": before,
         "after": after,
         "warnings": warnings,
+        "not_refreshed": not_refreshed,
         "message": "",
     }
 

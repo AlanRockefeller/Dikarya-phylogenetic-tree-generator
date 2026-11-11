@@ -185,8 +185,10 @@ timeout budget (not an ETA). Exit 75 means **show the report to the user and ask
 whether to interrupt or wait**. Do not automatically confirm. Only after the
 user explicitly approves losing those jobs' current work, send the exact
 printed `INTERRUPT <job-ids>` line on stdin. Changed IDs require a fresh choice.
-Exit 78 means a failed safety/configuration check (including a high2 worker
-that is still `deactivating`/`activating`); do not bypass it. Exit 70 after an
+Exit 78 means a failed safety/configuration check (including a high2 or
+voucher worker that is still `deactivating`/`activating`); do not bypass it. A
+unit that is `activating` only because it is crash-looping (SubState
+`auto-restart`) holds no job and does not block the restart. Exit 70 after an
 approved interrupt means some kills failed: the printed `interrupted` units
 lost their jobs, the `kill_failed` ones may still be running theirs, and
 nothing was restarted -- report both lists to the user. Exit 70 with
@@ -290,9 +292,13 @@ flask jobs-in-flight    # exits 1 and lists them if any job is live
 **Agents usually cannot run that command.** It calls `create_app()`, which
 requires `SECRET_KEY` from `/etc/dikarya/dikarya.environment.live` — a root-only
 file. Use the equivalent Redis check instead; all six must print `0` before you
-restart the worker:
+restart the worker. Redis requires a password (since
+`ops/deploy/2026-11-11-redis-auth-nginx-buffers.sh`: RQ unpickles queued jobs,
+so an open Redis meant code execution as `dikarya` for every shell user), so
+load the tree account's copy first; a `NOAUTH` error means you skipped it:
 
 ```bash
+set -a; . ~/.dikarya/redis.env; set +a     # REDIS_URL + REDISCLI_AUTH
 redis-cli LLEN rq:queue:phylo_high   ; redis-cli ZCARD rq:wip:phylo_high
 redis-cli LLEN rq:queue:phylo_bulk   ; redis-cli ZCARD rq:wip:phylo_bulk
 redis-cli LLEN rq:queue:voucher_sync ; redis-cli ZCARD rq:wip:voucher_sync
@@ -300,9 +306,12 @@ redis-cli LLEN rq:queue:voucher_sync ; redis-cli ZCARD rq:wip:voucher_sync
 
 `voucher_sync` is served only by `dikarya-worker-voucher`
 (`scripts/dikarya-worker-voucher.service`, own `var/logs/worker-voucher.log`),
-which is `PartOf=dikarya-worker.service`. The guarded wrapper does not check
-that queue, so `restart-dikarya-worker` kills a running scan unless you check
-it yourself.
+which is `PartOf=dikarya-worker.service`, so `restart-dikarya-worker` restarts
+it too. Since 2026-11-11 the installed guarded wrapper includes `voucher_sync`
+in its report and consent whenever that unit is running (each job carries a
+`queue` field), and the unit has the graceful drop-in (`KillMode=mixed`,
+`TimeoutStopSec=infinity`), so a restart drains a running scan instead of
+killing it. The wrapper refuses (78) if that drop-in is ever removed.
 
 `rq:queue:<name>` is the pending queue and `rq:wip:<name>` is RQ's
 StartedJobRegistry, so a non-zero `wip` means a job is executing *right now* and
@@ -540,17 +549,6 @@ When a new CLI version is published:
    `npx --no-install eslint app/static/js/inat_finder.js`, and spot-check the
    affected modes against live iNaturalist API responses before deploying.
 
-- **Rare Finds (`/rare-finds`) runs in the browser, like iNat Finder.**
-  `app/static/js/rare_finds.js` reads an iNaturalist search URL, ranks its
-  species-level taxa by live worldwide observation count (the taxon objects'
-  cached `observations_count` is stale for renamed taxa, so the shown list is
-  always re-counted) and builds the .pptx client-side with the vendored
-  `vendor/pptxgen-3.12.0.bundle.js`. The one server piece is
-  `/rare-finds/photo/<id>/<size>.<ext>`, which relays all-rights-reserved photos
-  because `static.inaturalist.org` sends no CORS header. It rebuilds the
-  upstream URL from validated parts and must stay that narrow -- never accept
-  a URL or host from the client. `?url=<search>` runs a search on load, so a
-  result can be shared as a link.
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
@@ -751,11 +749,16 @@ When a new CLI version is published:
   `Retry-After` of several minutes). A 429 sets the Redis key
   `CURATION_PAUSE_KEY` for that long and every process skips the lookup until
   it expires, so live labels fall back to GenBank's names during the wait.
-  MycoMap.org PR #17 exempts a key an admin has marked at `/admin/api-keys`:
-  `curated_genbank_rows()` sends `MYCOMAP_ORG_API_KEY` in `X-API-Key` whenever
+  MycoMap.org PR #17 gives a key an admin has marked at `/admin/api-keys` a
+  raised limit (Dikarya's is marked since 2026-11-11): 600 requests per 10
+  minutes per key, one running at a time with up to 20 waiting (past that a
+  429 with `Retry-After: 5`). `curated_genbank_rows()` sends
+  `MYCOMAP_ORG_API_KEY` in `X-API-Key` whenever
   the process has it (web and worker units do; the `tree` user's cron does
-  not, so the weekly pass stays anonymous and paced), and an exempt answer
-  carries `X-MycoMap-Rate-Limit: exempt`. A 401 (invalid key) or 403
+  not, so the weekly pass stays anonymous and paced), and a marked answer
+  carries `X-MycoMap-Rate-Limit: raised` (the PR text says `exempt`; that was
+  changed before merge). `event=mycomap_org.genbank_curation_raised` /
+  `_not_raised` log when that header appears or disappears. A 401 (invalid key) or 403
   (pending/disabled) logs `event=mycomap_org.auth_refused`, sets
   `CURATION_KEY_REFUSED_KEY` for 10 minutes and re-asks anonymously -- the key
   is an optimisation, never a reason to lose curated names. MycoMap.org drops
@@ -972,6 +975,10 @@ When a new CLI version is published:
   trees. A saved `widthPercent` replaces the old `spacingX` preference, which is
   ignored. "Stretch clade to screen width" (node menu) is a transient
   `horizontalPercent` that is never saved. Radial layout keeps the per-level step.
+  The fit must settle before the first paint, and `display.update()` resets every tip
+  label to phylotree's 14 px default; read "Layout must settle before the first
+  paint" in `app/static/js/CLAUDE.md` before touching the fit, label sizing or the
+  load order, and diagnose a flicker with `/job/<id>/view?layout_trace=1`.
 - **Long-branch breaks are layout-only.** `_computeLongBranchBreaks()` marks at
   most 3 outlier branches (≥25% of the drawn depth and ≥6× the 90th-percentile
   branch), and phylotree's `display-branch-length` hook draws them shortened with
@@ -1083,7 +1090,12 @@ signal is worth little once and a lot repeated -- that is what `free` encodes,
 the allowance that scores nothing because that many is ordinary use. One user
 hits one missing job; nobody hits nine. One `WARNING`
 (`event=security.actor_escalated`) fires when the total crosses
-`ESCALATION_THRESHOLD`, then that actor is silent for an hour.
+`ESCALATION_THRESHOLD`, then that actor is silent for an hour. After that
+hour it alerts again only on a request that actually *raises* its score: the
+score stays for the whole 6-hour window, and a zero-weight request (one
+`/health` check) used to re-escalate it. Loopback clients are never scored --
+behind ProxyFix only traffic that bypassed nginx (the restart wrapper's health
+check, an operator's `curl`) has a loopback address.
 
 - Actors are scored per **network** (/24 or /64), not per address, because
   rotation is free otherwise. The exact addresses ride along as the

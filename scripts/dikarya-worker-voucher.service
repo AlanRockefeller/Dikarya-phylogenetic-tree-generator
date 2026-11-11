@@ -6,8 +6,10 @@
 # (photo download + QR/OCR decode) and would hold a tree worker that long.
 #
 # PartOf=dikarya-worker.service, so restart-dikarya-worker restarts it too and
-# it never keeps running stale code after a deploy. That restart does NOT check
-# this queue, so check it by hand first:
+# it never keeps running stale code after a deploy. The guarded wrapper reports
+# this queue's running scans and asks before killing them, and requires
+# dikarya-worker-graceful.conf on this unit (see scripts/WORKER_RESTART.md).
+# With an older installed wrapper, check by hand first:
 #   redis-cli LLEN rq:queue:voucher_sync ; redis-cli ZCARD rq:wip:voucher_sync
 # A killed scan only loses its preview (nothing is written to iNaturalist until
 # an apply run); an apply re-validates every target before writing, so

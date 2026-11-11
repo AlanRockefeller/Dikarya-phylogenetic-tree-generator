@@ -78,12 +78,67 @@ class OrgResultError(Exception):
 # refused, all processes stop asking until the wait is over instead of each
 # one collecting its own 429.
 CURATION_PAUSE_KEY = "dikarya:mycomap-org:genbank-curation-paused"
-# Dikarya's key is exempt from that limit once a MycoMap.org admin marks it
-# (MycoMap.org PR #17; an exempt answer carries X-MycoMap-Rate-Limit: exempt).
+# Dikarya's key gets a raised limit once a MycoMap.org admin marks it
+# (MycoMap.org PR #17 as finally merged: 600 requests per 10 minutes per key,
+# one running at a time with up to 20 waiting -- past that a 429 with
+# Retry-After 5 -- and X-MycoMap-Rate-Limit: raised; the PR text's "exempt"
+# was replaced before merge).
 # The key is an optimisation there, never a requirement: a 401 (invalid) or
 # 403 (pending/disabled) is remembered here for 10 minutes, during which the
 # lookups go out anonymously, under the ordinary limit, as they did before.
 CURATION_KEY_REFUSED_KEY = "dikarya:mycomap-org:genbank-curation-key-refused"
+# Last allowance seen on a keyed genbank-curation answer ("raised" or
+# "limited"). A change is logged once; the key expires daily so a key that
+# stays unmarked is re-reported once a day rather than never again.
+CURATION_EXEMPT_STATE_KEY = "dikarya:mycomap-org:genbank-curation-exempt-state"
+# Header values that mean the key's mark applied ("exempt" was the pre-merge name).
+_CURATION_MARKED_VALUES = {"raised", "exempt"}
+
+
+# (state, monotonic time) of the last keyed answer this process checked in Redis.
+_curation_state_seen = None
+_CURATION_STATE_RECHECK_SECONDS = 600
+
+
+def _note_curation_exemption(response):
+    """Log when a keyed genbank-curation answer gains or loses the raised limit.
+
+    The mark (MycoMap.org PR #17) is visible only as the response header
+    X-MycoMap-Rate-Limit: raised. Losing it (key revoked, replaced or never
+    marked) otherwise shows up only later, as 429s.
+    """
+    try:
+        header = (response.headers.get("X-MycoMap-Rate-Limit") or "").strip().lower()
+        marked = header in _CURATION_MARKED_VALUES
+        state = "raised" if marked else "limited"
+        limit = (response.headers.get("RateLimit-Limit") or "-").strip()[:10]
+        # Skip the Redis round trip while this process saw the same state
+        # recently; the state changes about once a day, every GenBank fetch
+        # passes through here.
+        global _curation_state_seen
+        now = time.monotonic()
+        if (_curation_state_seen and _curation_state_seen[0] == state
+                and now - _curation_state_seen[1] < _CURATION_STATE_RECHECK_SECONDS):
+            return
+        from app.services.ncbi_pacing import connection
+        redis = connection()
+        previous = redis.get(CURATION_EXEMPT_STATE_KEY)
+        if isinstance(previous, bytes):
+            previous = previous.decode()
+        _curation_state_seen = (state, now)
+        if previous == state:
+            # Leave the expiry alone: refreshing it on every answer would
+            # keep an unmarked key from ever being re-reported.
+            return
+        redis.set(CURATION_EXEMPT_STATE_KEY, state, ex=86400)
+        if marked:
+            logger.info("event=mycomap_org.genbank_curation_raised previous=%s "
+                        "ratelimit_limit=%s", previous or "-", limit)
+        else:
+            logger.warning("event=mycomap_org.genbank_curation_not_raised previous=%s "
+                           "ratelimit_limit=%s", previous or "-", limit)
+    except Exception:
+        logger.debug("event=mycomap_org.curation_exempt_check_failed", exc_info=True)
 
 
 def curation_paused_for():
@@ -110,6 +165,125 @@ def _remember_curation_key_refusal():
         connection().set(CURATION_KEY_REFUSED_KEY, "refused", ex=600)
     except Exception:
         logger.warning("event=mycomap_org.curation_key_store_failed")
+
+
+# Alan 11/11/26 - The tree viewer's "Refresh MycoMap record(s)" calls these two
+# key-authenticated routes. Each has its own limit of 120 observations per 10
+# minutes for the key, so a 429 pauses only that route, for its Retry-After,
+# in every process -- a user clicking Refresh again must not hammer it.
+REFRESH_PATH = "admin/mycomap/refresh"
+SYNC_PATH = "sync-batch"
+REFRESH_PATHS = (REFRESH_PATH, SYNC_PATH)
+REFRESH_PAUSE_KEY_PREFIX = "dikarya:mycomap-org:refresh-paused:"
+REFRESH_DEFAULT_PAUSE_SECONDS = 600
+SYNC_BATCH_LIMIT = 100
+REFRESH_GRANT_URL = "https://mycomap.org/admin/api-keys"
+
+
+def _refresh_pause_key(path):
+    return REFRESH_PAUSE_KEY_PREFIX + ("sync" if path == SYNC_PATH else "refresh")
+
+
+def refresh_paused_for(path=REFRESH_PATH):
+    """Seconds left before ``path`` may be called again after a 429, or 0."""
+    try:
+        from app.services.ncbi_pacing import connection
+        remaining = connection().ttl(_refresh_pause_key(path))
+        return remaining if remaining and remaining > 0 else 0
+    except Exception:
+        return 0
+
+
+def _pause_refresh(path, seconds):
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(_refresh_pause_key(path), "rate_limited",
+                         ex=max(1, min(int(seconds), 3600)))
+    except Exception:
+        logger.warning("event=mycomap_org.refresh_pause_store_failed path=%s", path)
+
+
+def _wait_phrase(seconds):
+    seconds = int(seconds or 0)
+    if seconds >= 90:
+        return f"about {math.ceil(seconds / 60)} minutes"
+    return f"{max(seconds, 1)} seconds"
+
+
+def _safe_body_excerpt(raw, key, limit=500):
+    """A loggable excerpt of an error body: bounded, one line, key removed."""
+    text = (raw or b"").decode("utf-8", "replace")
+    if key:
+        text = text.replace(key, "[redacted]")
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text).strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _raise_refresh_http_error(path, exc, key):
+    """Turn a refresh/sync-batch HTTP error into a clear OrgResultError.
+
+    These routes explain themselves in the body ({"code": ...} or
+    {"error": ...}), which Dikarya did not use to read, so it is logged here
+    -- never the key, which is stripped from it should MycoMap echo it.
+    """
+    try:
+        raw = exc.read(4096) if exc.fp is not None else b""
+    except Exception:
+        raw = b""
+    excerpt = _safe_body_excerpt(raw, key)
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    code = str(payload.get("code") or "")[:64]
+    route = "refresh" if path == REFRESH_PATH else "sync"
+    retry_header = ((exc.headers.get("Retry-After") if exc.headers else None) or "").strip()
+    logger.warning(
+        "event=mycomap_org.refresh_http_error path=%s status=%s code=%s "
+        "retry_after=%s body=%s",
+        path, exc.code, code or "-", retry_header[:10] or "-", excerpt or "-",
+    )
+    if exc.code == 429:
+        retry_after = int(retry_header) if retry_header.isdigit() else REFRESH_DEFAULT_PAUSE_SECONDS
+        _pause_refresh(path, retry_after)
+        raise OrgResultError(
+            f"MycoMap.org's {route} limit was reached (120 observations per 10 "
+            f"minutes); try again in {_wait_phrase(retry_after)}.",
+            429, retryable=False, retry_after=retry_after,
+        ) from exc
+    if exc.code == 403 and code == "API_KEY_REFRESH_NOT_GRANTED":
+        logger.error("event=mycomap_org.refresh_not_granted path=%s key_len=%s key_sha256=%s",
+                     path, len(key), hashlib.sha256(key.encode()).hexdigest()[:12])
+        raise OrgResultError(
+            "MycoMap.org has not allowed Dikarya's access key to refresh records; "
+            f"a MycoMap.org admin must allow it at {REFRESH_GRANT_URL}.",
+            403, retryable=False, key_refused=True,
+        ) from exc
+    if exc.code in (401, 403):
+        logger.error(
+            "event=mycomap_org.auth_refused status=%s path=%s "
+            "key_env=MYCOMAP_ORG_API_KEY key_len=%s key_sha256=%s",
+            exc.code, path, len(key), hashlib.sha256(key.encode()).hexdigest()[:12],
+        )
+        raise OrgResultError(
+            f"MycoMap.org did not accept Dikarya's access key (HTTP {exc.code}).",
+            exc.code, retryable=False, key_refused=True,
+        ) from exc
+    if exc.code == 400:
+        detail = str(payload.get("error") or "").strip()
+        detail = re.sub(r"[\x00-\x1f\x7f]+", " ", detail)[:200]
+        raise OrgResultError(
+            "MycoMap.org rejected the request"
+            + (f" ({detail})" if detail else "")
+            + ". An observation must be written inat:<id>, mo:<id> or mp:<id>.",
+            400, retryable=False,
+        ) from exc
+    raise OrgResultError(
+        f"MycoMap.org could not {route} the record (HTTP {exc.code}).",
+        502, retryable=exc.code >= 500,
+    ) from exc
 
 
 def _pause_curation(seconds):
@@ -188,7 +362,11 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
     try:
         with diagnostic_urlopen(request, timeout=timeout) as response:
             data = response.read(limit + 1)
+            if path == "genbank-curation" and key:
+                _note_curation_exemption(response)
     except urllib.error.HTTPError as exc:
+        if path in REFRESH_PATHS:
+            _raise_refresh_http_error(path, exc, key)
         # Alan 10/7/26 - A 401/403 is a refusal, not an outage. It used to fall
         # into the generic retryable 502 below, so the user was told MycoMap
         # "could not complete the BLAST request" and an NCBI rebuild would sit
@@ -869,65 +1047,218 @@ def observation_sequences(reference, *, deadline=None):
     ]
 
 
+# Reasons MycoMap.org gives for leaving a sequence's name alone. "same-name" is
+# the ordinary outcome and only logged; "no-access" means the key's account
+# may not edit that sequence (it needs a site-wide admin, project leader,
+# project assistant or lab contributor role, or membership of the sequence's
+# project) -- a permission gap to report, not a failed refresh.
+SEQUENCE_NAME_REASON_TEXT = {
+    # reason: (one sequence, several sequences)
+    "trash": ("it is in MycoMap's trash", "they are in MycoMap's trash"),
+    "flagged": ("it is flagged on MycoMap", "they are flagged on MycoMap"),
+    "would-regress": ("it already has a more specific name than the refreshed one",
+                      "they already have more specific names than the refreshed one"),
+    "no-access": ("Dikarya's MycoMap account may not edit it",
+                  "Dikarya's MycoMap account may not edit them"),
+}
+NO_ACCESS_HELP = ("Editing needs a site-wide admin, project leader, project assistant "
+                  "or lab contributor role, or membership of the sequence's project.")
+
+
+def _clean_text(value, limit=200):
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "")).strip()[:limit]
+
+
+def _sequence_name_entries(value):
+    """sequenceNames as a list of dicts, whether sent as a list or keyed by id."""
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    if isinstance(value, dict):
+        entries = []
+        for key, entry in value.items():
+            if isinstance(entry, dict):
+                entries.append({"id": key, **entry})
+        return entries
+    return []
+
+
+def summarize_refresh_response(payload):
+    """What a refresh with renameSequences did to the observation's sequences."""
+    payload = payload if isinstance(payload, dict) else {}
+    renamed = 0
+    skipped = {}
+    for entry in _sequence_name_entries(payload.get("sequenceNames")):
+        reason = _clean_text(entry.get("reason") or entry.get("skipReason"), 40).lower()
+        status = _clean_text(entry.get("status"), 40).lower()
+        if not reason and (entry.get("renamed") is False
+                           or status in {"skipped", "unchanged", "not-renamed"}):
+            reason = status if status and status != "skipped" else "unspecified"
+        if reason:
+            skipped[reason] = skipped.get(reason, 0) + 1
+        else:
+            renamed += 1
+    local_sync = payload.get("localSync") if isinstance(payload.get("localSync"), dict) else {}
+    name_repair = payload.get("nameRepair") if isinstance(payload.get("nameRepair"), dict) else {}
+    return {
+        "renamed": renamed,
+        "skipped": skipped,
+        "old_name": _clean_text(local_sync.get("oldName")),
+        "new_name": _clean_text(local_sync.get("newName")),
+        "name_repair_warning": _clean_text(name_repair.get("warning"), 300),
+    }
+
+
 def _refresh_observation(reference, deadline):
-    return _read("admin/mycomap/refresh", method="POST", body={"observation": reference},
-                 authenticated=True, deadline=deadline, timeout=REFRESH_REQUEST_TIMEOUT)
+    """Refresh one observation and rename its sequences; returns the summary.
 
-
-def refresh_observations(references):
-    """Refresh observations from their source, then sync them onto their sequences.
-
-    Mirrors MycoMap.org's own Refresh button: admin/mycomap/refresh pulls each
-    observation from iNaturalist or Mushroom Observer, and sync-batch copies the
-    refreshed name onto the observation's sequences -- which is where
-    sequences/batch, and so every Dikarya label, reads it from. Returns a list
-    of warnings; raises OrgResultError only when nothing could be refreshed.
+    renameSequences is what MycoMap.org's own Refresh button sends. Without it
+    the refresh only names sequences that have no name yet (mycomap.com's
+    behaviour since 2026-10-08), and sync-batch never renames, so a corrected
+    identification never reached a sequence that already had one.
     """
+    data = _read(REFRESH_PATH, method="POST",
+                 body={"observation": reference, "renameSequences": True},
+                 authenticated=True, deadline=deadline, timeout=REFRESH_REQUEST_TIMEOUT)
+    try:
+        payload = json.loads(data) if data else {}
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    summary = summarize_refresh_response(payload)
+    logger.info(
+        "event=mycomap_org.refresh_result reference=%s renamed=%s skipped=%s "
+        "local_old=%r local_new=%r name_repair_warning=%r",
+        reference, summary["renamed"],
+        ",".join(f"{k}:{v}" for k, v in sorted(summary["skipped"].items())) or "-",
+        summary["old_name"] or "-", summary["new_name"] or "-",
+        summary["name_repair_warning"] or "-",
+    )
+    return summary
+
+
+def _refresh_notes(reference, summary):
+    notes = []
+    for reason, count in sorted(summary["skipped"].items()):
+        text = SEQUENCE_NAME_REASON_TEXT.get(reason)
+        if not text:
+            continue
+        noun = "sequence" if count == 1 else "sequences"
+        note = (f"MycoMap.org did not rename {count} {noun} of {reference} "
+                f"({reason}): {text[0 if count == 1 else 1]}.")
+        if reason == "no-access":
+            note += " " + NO_ACCESS_HELP
+        notes.append(note)
+    if summary["name_repair_warning"]:
+        notes.append(f"MycoMap.org ({reference}): {summary['name_repair_warning']}")
+    return notes
+
+
+def refresh_observations(references, not_refreshed=None):
+    """Refresh observations from their source and rename their sequences.
+
+    Mirrors MycoMap.org's own Refresh button: admin/mycomap/refresh with
+    renameSequences pulls each observation from iNaturalist or Mushroom
+    Observer and copies the refreshed name onto its sequences -- which is
+    where sequences/batch, and so every Dikarya label, reads it from.
+    sync-batch follows as before; it renames nothing but is harmless. Returns
+    a list of warnings; raises OrgResultError only when nothing could be
+    refreshed. When ``not_refreshed`` is a list, every reference that was not
+    refreshed (failed, or never attempted after a 429) is appended to it.
+    """
+    import threading
     from concurrent.futures import ThreadPoolExecutor
+
+    paused = refresh_paused_for(REFRESH_PATH)
+    if paused:
+        raise OrgResultError(
+            "MycoMap.org's refresh limit was reached (120 observations per 10 "
+            f"minutes); try again in {_wait_phrase(paused)}.",
+            429, retryable=False, retry_after=paused)
 
     warnings = []
     deadline = time.monotonic() + REFRESH_BUDGET_SECONDS
     refused = None
+    rate_limited = None
     failed = []
+    summaries = {}
     # The first call alone, so a refused key is reported once rather than by
     # every worker thread at the same moment.
     try:
-        _refresh_observation(references[0], deadline)
+        summaries[references[0]] = _refresh_observation(references[0], deadline)
     except OrgResultError as exc:
-        if exc.retryable:
-            failed.append(references[0])
-        else:
+        if exc.status == 429:
+            rate_limited = exc
+        elif exc.key_refused:
+            # Only a refused key says anything about the remaining
+            # references; a 400/404 is about this observation alone.
             refused = exc
-    if refused is None and len(references) > 1:
+        else:
+            logger.warning("event=mycomap_org.refresh_failed reference=%s",
+                           references[0], exc_info=True)
+            failed.append(references[0])
+    if refused is None and rate_limited is None and len(references) > 1:
+        stop = threading.Event()
+        lock = threading.Lock()
+
         def attempt(reference):
-            try:
-                _refresh_observation(reference, deadline)
-            except OrgResultError:
-                logger.warning("event=mycomap_org.refresh_failed reference=%s",
-                               reference, exc_info=True)
+            nonlocal rate_limited
+            if stop.is_set():
                 return reference
+            try:
+                summary = _refresh_observation(reference, deadline)
+            except OrgResultError as exc:
+                if exc.status == 429:
+                    # Honour Retry-After: no further calls from this batch.
+                    stop.set()
+                    with lock:
+                        rate_limited = rate_limited or exc
+                else:
+                    logger.warning("event=mycomap_org.refresh_failed reference=%s",
+                                   reference, exc_info=True)
+                return reference
+            with lock:
+                summaries[reference] = summary
             return None
         with ThreadPoolExecutor(max_workers=REFRESH_WORKERS) as pool:
             failed.extend(ref for ref in pool.map(attempt, references[1:]) if ref)
+    # Everything without a summary, including references a 429 stopped before
+    # they were attempted, so none of them is reported as refreshed.
+    missing = [ref for ref in references if ref not in summaries]
+    if not_refreshed is not None:
+        not_refreshed.extend(missing)
     if refused is not None:
-        warnings.append(f"{refused} Names were synced from MycoMap's stored "
-                        "observations without re-reading iNaturalist or Mushroom Observer.")
+        warnings.append(str(refused))
+    elif rate_limited is not None:
+        warnings.append(f"{rate_limited} Not refreshed: " + ", ".join(missing[:10])
+                        + (f" and {len(missing) - 10} others" if len(missing) > 10 else "")
+                        + ".")
     elif failed:
         warnings.append("MycoMap.org could not refresh " + ", ".join(failed[:10])
                         + (" and others" if len(failed) > 10 else "")
                         + " from the source site.")
+    for reference in references:
+        if reference in summaries:
+            warnings.extend(_refresh_notes(reference, summaries[reference]))
 
+    # Nothing refreshed because the key was refused or the route is rate
+    # limited: say so plainly (the route maps a 429 to 429 + Retry-After)
+    # rather than sending sync-batch with the same key, which renames nothing
+    # and, refused too, would replace the clear message with a generic 502.
+    if not summaries and (refused is not None or rate_limited is not None):
+        raise refused if refused is not None else rate_limited
+
+    if refresh_paused_for(SYNC_PATH):
+        return warnings
     try:
-        _read("sync-batch", method="POST",
-              body={"action": "sync", "observations": list(references)},
-              authenticated=True, deadline=time.monotonic() + REFRESH_REQUEST_TIMEOUT,
-              timeout=REFRESH_REQUEST_TIMEOUT)
+        for offset in range(0, len(references), SYNC_BATCH_LIMIT):
+            _read(SYNC_PATH, method="POST",
+                  body={"action": "sync",
+                        "observations": list(references[offset:offset + SYNC_BATCH_LIMIT])},
+                  authenticated=True, deadline=time.monotonic() + REFRESH_REQUEST_TIMEOUT,
+                  timeout=REFRESH_REQUEST_TIMEOUT)
     except OrgResultError:
-        if refused is not None or len(failed) == len(references):
+        if not summaries:
             raise
         logger.warning("event=mycomap_org.sync_failed count=%s", len(references), exc_info=True)
-        warnings.append("MycoMap.org refreshed the observations but could not update "
-                        "their sequence records, so some names may still be the old ones.")
     return warnings
 
 

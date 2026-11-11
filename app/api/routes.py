@@ -3722,7 +3722,7 @@ def rename_tree_tip(job_id):
 @limiter.limit("5 per minute; 50 per hour")
 def refresh_tree_mycomap_records(job_id):
     """Refresh selected observation records and persist changed MycoMap tip labels."""
-    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    job, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -3750,7 +3750,7 @@ def refresh_tree_mycomap_records(job_id):
             normalized_tip_names.append(name)
 
     job_dir = Config.JOB_DIR / job_id
-    from app.services.mycomap_service import MycoMapRefreshError
+    from app.services.mycomap_service import MycoMapRefreshError, MycoMapRefreshRateLimited
     try:
         from app.services.mycomap_service import (
             extract_mycomap_observation_reference,
@@ -3759,7 +3759,9 @@ def refresh_tree_mycomap_records(job_id):
         from app.services.tree_edit_service import (
             _tree_tip_set,
             load_tree_state,
+            read_input_info,
             refresh_mycomap_tip_labels,
+            refresh_sequence_metadata_names,
             save_tree_state,
             tree_state_lock,
         )
@@ -3800,10 +3802,16 @@ def refresh_tree_mycomap_records(job_id):
                     "status": "error",
                     "error": "One or more selected tree records are no longer available.",
                 }), 409
+            # Alan 11/11/26 - The name the job was built with, from input_info.json,
+            # lets a refresh fix a label even when MycoMap already held the new name.
+            # Read once here; the metadata update below writes this same dict.
+            input_info = read_input_info(job_dir)
+            sequence_metadata = (input_info or {}).get("sequence_metadata")
             label_result = refresh_mycomap_tip_labels(
                 state,
                 normalized_tip_names,
                 refresh_result,
+                sequence_metadata if isinstance(sequence_metadata, list) else [],
             )
             changes = label_result["changes"]
             if changes:
@@ -3811,14 +3819,49 @@ def refresh_tree_mycomap_records(job_id):
                 # Refreshed labels are not undoable; an older checkpoint would
                 # revert them along with whatever it does undo.
                 clear_undo_checkpoint(job_dir)
+            # Alan 11/11/26 - Record the refreshed name in the job's own metadata too.
+            # Best effort: the labels are already saved, so a failure here must
+            # not turn a successful refresh into a 500. Skipped while the
+            # pipeline is live, because the worker rewrites input_info.json
+            # from memory without this lock and one write would erase the other.
+            metadata_changes = []
+            # The status check_job_access read is from before the network
+            # refresh; a recompute may have been queued since, so re-read it.
+            if job is not None:
+                try:
+                    db.session.refresh(job)
+                except Exception:
+                    logger.debug("Could not re-read job status", exc_info=True)
+            if job is not None and job.status in ("queued", "running"):
+                logger.info("event=mycomap.refresh_metadata_skipped job=%s reason=job_active",
+                            job_id)
+            else:
+                try:
+                    metadata_changes = refresh_sequence_metadata_names(
+                        job_dir, input_info, label_result.get("settled_tips") or [],
+                        refresh_result)
+                except Exception as exc:
+                    from app.services.log_context import log_degradation
+                    logger.debug("refresh metadata update failed", exc_info=True)
+                    log_degradation(
+                        logger, "mycomap_refresh_metadata",
+                        "Refreshed tree labels were saved, but input_info.json "
+                        "sequence_metadata could not be updated", job=job_id,
+                        error=type(exc).__name__)
         return jsonify({
             "status": "success",
-            "refreshed_count": len(references),
+            "refreshed_count": max(
+                0, len(references) - len(refresh_result.get("not_refreshed") or [])),
             "updated_tip_count": len(changes),
             "changes": changes,
+            "metadata_changes": metadata_changes,
             "warnings": list(refresh_result.get("warnings") or []) + label_result["warnings"],
             "message": refresh_result.get("message") or "",
         })
+    except MycoMapRefreshRateLimited as exc:
+        response = jsonify({"status": "error", "error": str(exc)})
+        response.headers["Retry-After"] = str(exc.retry_after)
+        return response, 429
     except MycoMapRefreshError as exc:
         logger.warning("MycoMap tree-record refresh failed for job %s: %s", job_id, exc)
         return jsonify({"status": "error", "error": str(exc)}), 502
@@ -5778,9 +5821,45 @@ def claude_review(job_id):
 
     data = request.get_json(silent=True) or {}
     force_refresh, _ = coerce_bool(data.get("refresh"), False)
+    if force_refresh:
+        # A refresh skips the cache and spends one of the site-wide daily
+        # reviews, so it needs edit access. Edit access is open on ownerless
+        # jobs, though, so the real bound is the per-requester and per-job
+        # daily budget reserved below.
+        _, edit_error, edit_status = check_job_access(job_id, mode="edit")
+        if edit_error:
+            return jsonify({
+                "status": "error",
+                "error": "Only the job's owner can re-run the Claude review.",
+            }), 403 if edit_status in (401, 403) else edit_status
+        from app.services.security_actors import actor_key
+        from app.services.tree_analysis_service import reserve_review_refresh
+        requester = (f"user:{current_user.id}" if current_user.is_authenticated
+                     else f"net:{actor_key(request.remote_addr)}")
+        try:
+            refund_refresh = reserve_review_refresh(requester, job_id)
+        except TreeAnalysisRateLimited as exc:
+            response = jsonify({"status": "error", "error": str(exc)})
+            response.headers["Retry-After"] = str(exc.retry_after_seconds)
+            return response, 429
+        except TreeAnalysisUnavailable as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 503
+    else:
+        refund_refresh = None
 
     try:
-        payload = review_job(job_dir, force_refresh=force_refresh)
+        try:
+            payload = review_job(job_dir, force_refresh=force_refresh)
+        except TreeAnalysisUpstreamError:
+            # The model was called and may have billed; the re-run is spent.
+            raise
+        except Exception:
+            # Already running, daily limit, no capacity, nothing to review: give
+            # the re-run back. The site-wide daily reservation is never refunded,
+            # so total spend stays bounded whichever way this goes.
+            if refund_refresh is not None:
+                refund_refresh()
+            raise
     except TreeAnalysisDailyLimit as exc:
         response = jsonify({"status": "error", "error": str(exc)})
         response.headers["Retry-After"] = str(exc.retry_after_seconds)

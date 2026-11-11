@@ -286,8 +286,9 @@ class RequestDiagnosticsWiringTests(unittest.TestCase):
         # scoring sits between those branches and the early return. The
         # invariant under test is unchanged -- the scanner branch is still
         # beside the targeted one and still ahead of the unmatched-route
-        # early return.
-        window = source[classify_index:classify_index + 4200]
+        # early return. 4200 -> 4800 for the loopback exemption ahead of the
+        # actor scoring (2026-11-11).
+        window = source[classify_index:classify_index + 4800]
         self.assertIn("elif bucket == BUCKET_SCANNER:", window)
         self.assertLess(
             window.index("elif bucket == BUCKET_SCANNER:"),
