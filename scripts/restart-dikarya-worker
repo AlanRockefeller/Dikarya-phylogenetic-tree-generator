@@ -102,8 +102,15 @@ HIGH_QUEUE_UNITS = ("dikarya-worker.service", "dikarya-worker-high2.service",
 VOUCHER_UNIT = "dikarya-worker-voucher.service"
 
 
-def _queue_units(bulk):
-    """Units restarted together, or None when one is between states."""
+def _queue_units(bulk, waiting=None):
+    """Units restarted together, or None when one is between states.
+
+    A crash-looping unit (activating/auto-restart) has no process to freeze,
+    so it is not returned, but it is appended to ``waiting`` when given: it
+    can leave auto-restart and take a job at any moment, so main() still
+    checks its graceful-shutdown settings, reports its queue and restarts it
+    by name, so that a job it picks up meanwhile is drained rather than killed.
+    """
     if bulk:
         return ["dikarya-worker-bulk.service"]
     units = [HIGH_QUEUE_UNITS[0]]
@@ -120,6 +127,8 @@ def _queue_units(bulk):
             # so no job. Refusing here would block the very restart that rolls
             # out the fix; PartOf restarts it with dikarya-worker anyway.
             print(unit + " is crash-looping (auto-restart); it holds no job.")
+            if waiting is not None:
+                waiting.append(unit)
         elif state not in ("inactive", "failed"):
             # Alan 9/30/26 - A draining (deactivating) worker can still be
             # running a job the queue report lists. Leaving it out would let an
@@ -139,11 +148,12 @@ def main(*, bulk=None, after_current=False):
             return 64
         return _restart_bulk_after_current()
     queue = "phylo_bulk" if bulk else "phylo_high"
-    units = _queue_units(bulk)
+    waiting = []
+    units = _queue_units(bulk, waiting)
     if units is None:
         return 78
     # Safe default even if a job arrives between the check and systemctl restart.
-    for unit in units:
+    for unit in units + waiting:
         mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")
         timeout = run("/usr/bin/systemctl", "show", unit, "-p", "TimeoutStopUSec", "--value")
         if mode != "mixed" or timeout != "infinity":
@@ -162,7 +172,7 @@ def main(*, bulk=None, after_current=False):
                     raise ValueError("Unsupported environment value")
                 env[key] = values[0]
 
-    queues = [queue] + (["voucher_sync"] if VOUCHER_UNIT in units else [])
+    queues = [queue] + (["voucher_sync"] if VOUCHER_UNIT in units + waiting else [])
 
     def report_one(name):
         result = subprocess.check_output([
@@ -183,6 +193,11 @@ def main(*, bulk=None, after_current=False):
     state = report()
     print(json.dumps(state, indent=2), flush=True)
     ids = sorted(job["id"] for job in state["jobs"])
+    if any(job.get("interruptible") is False for job in state["jobs"]):
+        # No consent line is offered: see dikarya_worker_restart_report.py.
+        print("A Voucher Sync apply is writing to iNaturalist and cannot be interrupted "
+              "safely. Wait for it to finish, then re-run this.", flush=True)
+        return 75
     if ids:
         token = "INTERRUPT " + ",".join(ids)
         print("Running work will be lost by immediate restart. Default: leave worker running.")
@@ -237,7 +252,9 @@ def main(*, bulk=None, after_current=False):
             return 70
     # --no-block: an idle-check race drains safely in the background; do not
     # hold an agent tool call open for the duration of a newly started job.
-    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", *units], check=True)
+    # A crash-looping unit is named too: PartOf alone would restart it, but
+    # naming it keeps the restart explicit and covers one that started since.
+    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", *units, *waiting], check=True)
     print("Restart requested. Check ActiveState/MainPID and worker logs for completion.")
     return 0
 

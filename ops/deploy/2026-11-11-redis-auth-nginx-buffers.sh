@@ -68,7 +68,12 @@ done
 say "2. nginx buffers"
 SITE=/etc/nginx/sites-available/dikarya
 if cmp -s "$APP/ops/nginx/dikarya" "$SITE"; then
+    # Reload anyway: a run that installed the file but failed to reload left
+    # nginx on the old configuration, and a re-run must not skip that.
     echo "   already installed"
+    if (( ! DRY )); then
+        nginx -t && systemctl reload nginx && echo "   nginx reloaded"
+    fi
 else
     backup "$SITE"
     run install -o root -g root -m 0644 "$APP/ops/nginx/dikarya" "$SITE"
@@ -108,9 +113,11 @@ fi
 [[ -n "$pw" ]] || pw=$(openssl rand -hex 32)
 url="redis://:${pw}@localhost:6379/${db}"
 
+# The password never goes on a command line (any local user can read those):
+# redis-cli takes it from REDISCLI_AUTH, and CONFIG SET goes in on stdin.
 # Is Redis already enforcing this password?
-if REDISCLI_AUTH="$pw" redis-cli --no-auth-warning ping 2>/dev/null | grep -q PONG \
-   && ! redis-cli ping 2>/dev/null | grep -q PONG; then
+if REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -n "$db" ping 2>/dev/null | grep -q PONG \
+   && ! redis-cli -n "$db" ping 2>/dev/null | grep -q PONG; then
     already_live=1
 else
     already_live=0
@@ -118,15 +125,31 @@ fi
 
 # Refuse while anything is queued or running: the restart below would kill it.
 busy=0
+# -n: the queues live in REDIS_URL's database, which need not be 0. Before
+# the password is live, REDISCLI_AUTH must be unset, not empty.
+rcli() {
+    if (( already_live )); then
+        REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -n "$db" "$@"
+    else
+        redis-cli -n "$db" "$@"
+    fi
+}
 for q in phylo_high phylo_bulk voucher_sync; do
-    if (( already_live )); then a=(--no-auth-warning -a "$pw"); else a=(); fi
-    n=$(( $(redis-cli "${a[@]}" LLEN "rq:queue:$q") + $(redis-cli "${a[@]}" ZCARD "rq:wip:$q") ))
+    n=$(( $(rcli LLEN "rq:queue:$q") + $(rcli ZCARD "rq:wip:$q") ))
     echo "   $q queued+running=$n"
     (( n == 0 )) || busy=1
 done
 if (( busy )); then
     echo "   Jobs are in flight; nothing changed for step 3. Re-run when the queues are empty." >&2
     exit 75
+fi
+
+# Preflight BEFORE changing anything: a broken import must not be restarted
+# into, and the password must not go live for processes that cannot start.
+# As tree, not root: a root import would leave root-owned __pycache__ files.
+if ! runuser -u tree -- "$APP/scripts/dikarya-preflight"; then
+    echo "   preflight failed; nothing changed for step 3. Fix the import and re-run." >&2
+    exit 1
 fi
 
 if (( DRY )); then
@@ -150,24 +173,38 @@ chown tree:tree "$TREE_ENV"; chmod 0600 "$TREE_ENV"
 
 # 3c. Redis config (persists across restarts) -- the file now holds a secret.
 backup "$REDIS_CONF"
-if grep -qE '^[[:space:]]*requirepass[[:space:]]' "$REDIS_CONF"; then
-    sed -i -E "s|^[[:space:]]*requirepass[[:space:]].*|requirepass $pw|" "$REDIS_CONF"
-else
-    printf '\n# Dikarya, %s: RQ unpickles queued jobs; never run without a password.\nrequirepass %s\n' "$STAMP" "$pw" >> "$REDIS_CONF"
+# Rewritten with shell builtins only (read/printf), so $pw is never an
+# argument of an external command such as sed.
+tmp=$(mktemp "$REDIS_CONF.XXXXXX")
+replaced=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*requirepass[[:space:]] ]]; then
+        printf 'requirepass %s\n' "$pw"; replaced=1
+    else
+        printf '%s\n' "$line"
+    fi
+done < "$REDIS_CONF" > "$tmp"
+if (( ! replaced )); then
+    printf '\n# Dikarya, %s: RQ unpickles queued jobs; never run without a password.\nrequirepass %s\n' "$STAMP" "$pw" >> "$tmp"
 fi
-chown root:redis "$REDIS_CONF"; chmod 0640 "$REDIS_CONF"
+chown root:redis "$tmp"; chmod 0640 "$tmp"
+mv "$tmp" "$REDIS_CONF"
 
 # 3d. Go live without restarting Redis, then restart the clients at once.
 if (( ! already_live )); then
-    redis-cli CONFIG SET requirepass "$pw" >/dev/null
+    printf 'CONFIG SET requirepass %s\n' "$pw" | redis-cli >/dev/null
 fi
 echo "   requirepass live"
 
 set +e
-# As tree, not root: a root import would leave root-owned __pycache__ files.
-runuser -u tree -- "$APP/scripts/dikarya-preflight"; pre=$?
 /usr/local/sbin/restart-dikarya-web; web=$?
-systemctl restart dikarya-worker dikarya-worker-bulk dikarya-metrics; wrk=$?
+# The guarded wrappers, not a bare systemctl restart: they re-check the
+# queues and each unit's graceful-shutdown drop-in at the moment of restart,
+# so a job that arrived since the check above is drained, never killed. With
+# no consent on stdin a busy queue answers 75 and nothing is restarted.
+/usr/local/sbin/restart-dikarya-worker </dev/null; wrk=$?
+/usr/local/sbin/restart-dikarya-worker-bulk </dev/null; bulk=$?
+/usr/local/sbin/restart-dikarya-metrics; met=$?
 set -e
 
 # --------------------------------------------------------------------------
@@ -175,12 +212,21 @@ say "verification"
 redis-cli ping 2>&1 | grep -q NOAUTH && echo "   ok: unauthenticated redis-cli is refused" \
     || echo "   WARNING: unauthenticated redis-cli was NOT refused" >&2
 REDISCLI_AUTH="$pw" redis-cli --no-auth-warning ping | grep -q PONG && echo "   ok: password works"
-sleep 5
-for u in dikarya-web dikarya-worker dikarya-worker-high2 dikarya-worker-voucher dikarya-worker-bulk dikarya-metrics; do
+# Bounded wait for every expected unit to be active and its RQ worker
+# registered; "Done" only when both hold.
+units=(dikarya-web dikarya-worker dikarya-worker-high2 dikarya-worker-voucher dikarya-worker-bulk dikarya-metrics)
+for attempt in $(seq 1 30); do
+    inactive=0
+    for u in "${units[@]}"; do [[ "$(systemctl is-active "$u")" == active ]] || inactive=1; done
+    registered=$(REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -n "$db" SCARD rq:workers)
+    (( inactive == 0 && registered >= 4 )) && break
+    sleep 2
+done
+for u in "${units[@]}"; do
     printf '   %-24s %s\n' "$u" "$(systemctl is-active "$u")"
 done
-echo "   RQ workers registered: $(REDISCLI_AUTH="$pw" redis-cli --no-auth-warning SCARD rq:workers) (expect 4)"
-echo "   preflight=$pre web-restart=$web worker-restart=$wrk (0 = ok; web 69/70/75: see CLAUDE.md table)"
-(( pre == 0 && web == 0 && wrk == 0 )) || exit 1
+echo "   RQ workers registered: $registered (expect 4)"
+echo "   web-restart=$web worker-restart=$wrk bulk-restart=$bulk metrics-restart=$met (0 = ok; web 69/70/75: see CLAUDE.md table; worker 75 = busy, re-run that wrapper)"
+(( web == 0 && wrk == 0 && bulk == 0 && met == 0 && inactive == 0 && registered >= 4 )) || exit 1
 echo
 echo "Done. The tree account can now run:  set -a; . ~/.dikarya/redis.env; set +a; redis-cli LLEN rq:queue:phylo_high"

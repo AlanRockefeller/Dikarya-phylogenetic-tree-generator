@@ -21,12 +21,15 @@
 #   cp scripts/dikarya-worker-hardening.conf /etc/systemd/system/dikarya-worker-voucher.service.d/hardening.conf
 #   cp scripts/dikarya-umask.conf            /etc/systemd/system/dikarya-worker-voucher.service.d/umask.conf
 #   cp scripts/dikarya-worker-voucher-memory.conf /etc/systemd/system/dikarya-worker-voucher.service.d/zz-memory.conf
+#   cp scripts/dikarya-worker-graceful.conf  /etc/systemd/system/dikarya-worker-voucher.service.d/zz-graceful.conf
 #   systemctl daemon-reload && systemctl enable --now dikarya-worker-voucher
 #   grep "Worker serving queue" /var/www/dikarya/var/logs/worker-voucher.log
 #
-# The graceful-shutdown drop-in is deliberately NOT installed here: it sets
-# TimeoutStopSec=infinity, which would make every restart-dikarya-worker wait
-# up to 3h for a scan to finish.
+# The graceful-shutdown drop-in is required: the guarded restart-dikarya-worker
+# refuses (exit 78) while this unit runs without it. It sets
+# TimeoutStopSec=infinity, so a restart drains a running scan (up to its 3h RQ
+# timeout) instead of killing it; the wrapper reports that scan first and only
+# an explicit INTERRUPT approval cuts it short.
 #
 # To back out: systemctl disable --now dikarya-worker-voucher, then remove the
 # unit and its .d directory. Queued runs stay in Redis until a worker returns.

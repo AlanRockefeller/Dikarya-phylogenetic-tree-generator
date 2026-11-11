@@ -51,7 +51,8 @@
     requestAnimationFrame(frame);
     (function hook() {
         var C = window.DikaryaTreeViewer;
-        if (!C) return setTimeout(hook, 1);
+        // Give up with the capture window, so a viewer that never loads leaves no timer behind.
+        if (!C) return performance.now() - t0 < 5000 ? setTimeout(hook, 1) : undefined;
         ['render', '_draw', '_relayoutHorizontal', '_settleFittedWidth', '_runFitCheck', 'settleLayoutNow',
          'applyRenames', 'setHorizontalPercent', 'setSpacingState', 'setTipLabelGap', 'applyTextSizing',
          '_addSupportLabels', '_renderCladeAnnotations', 'setCladeAnnotations', 'restoreSelectionSets',
@@ -1738,7 +1739,7 @@
 
 <script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=9"></script>
 
-<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=120"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=121"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

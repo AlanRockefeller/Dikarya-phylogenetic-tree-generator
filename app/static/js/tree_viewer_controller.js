@@ -465,8 +465,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         if (claudeReviewSubtitle) {
             const when = payload?.generated_at ? new Date(payload.generated_at * 1000).toLocaleString() : '';
+            // Alan 11/11/26 - Only offer Re-run where the button exists; view-only pages have none.
+            const rerunHint = btnClaudeReviewRefresh ? ' — use Re-run for a fresh one.' : '.';
             claudeReviewSubtitle.textContent = payload?.cached
-                ? `Saved review${when ? ` from ${when}` : ''} — use Re-run for a fresh one.`
+                ? `Saved review${when ? ` from ${when}` : ''}${rerunHint}`
                 : `Reviewed by ${payload?.model || 'Claude'}${when ? ` at ${when}` : ''}.`;
         }
 

@@ -93,6 +93,10 @@ def report_voucher():
             limit = int(raw[1]) if raw[1] else None
             jobs.append({"id": run_id, "owner": (row["email"] or "anonymous") if row else "unknown",
                          "description": f"voucher sync {row['kind']}" if row else "voucher sync",
+                         # An apply writes to iNaturalist and only records what it wrote
+                         # once it returns, so killing one strands a preview that still
+                         # offers completed writes. The wrapper never offers to interrupt it.
+                         "interruptible": not row or row["kind"] != "apply",
                          "run_status": row["status"] if row else None,
                          "elapsed_seconds": elapsed,
                          "timeout_seconds": limit,

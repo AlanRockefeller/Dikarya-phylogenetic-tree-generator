@@ -498,7 +498,8 @@ def test_refresh_bad_reference_explains_the_accepted_forms(monkeypatch):
         org._refresh_observation("inat:1", None)
     assert raised.value.status == 400
     assert "Invalid observation" in str(raised.value)
-    assert "mp:<id>" in str(raised.value)
+    assert "mo:<id>" in str(raised.value)
+    assert "mp:<id>" not in str(raised.value)
 
 
 def test_tip_refresh_is_quiet_when_a_hand_edited_label_already_has_the_new_name():
@@ -706,3 +707,35 @@ def test_refused_key_on_the_first_reference_raises_its_message_without_syncing(m
     assert "admin" in str(raised.value)
     assert not any(url.endswith("/sync-batch") for url in calls)
     assert len(calls) == 1
+
+
+def test_tip_refresh_leaves_a_historical_note_beside_the_new_name():
+    from app.services.tree_edit_service import refresh_mycomap_tip_labels
+
+    label = "iNat154644100 Podaxis pistillaris (was Podaxis inyoensis)"
+    result = refresh_mycomap_tip_labels(
+        _state(label), [_ORIGINAL_TIP],
+        _refresh_fixture("Podaxis inyoensis", "Podaxis pistillaris"))
+    assert result["changes"] == []
+    assert result["settled_tips"] == [_ORIGINAL_TIP]
+
+
+def test_tip_refresh_skips_references_that_were_not_refreshed():
+    from app.services.tree_edit_service import refresh_mycomap_tip_labels
+
+    refresh = _refresh_fixture("Podaxis inyoensis", "Podaxis pistillaris")
+    refresh["not_refreshed"] = ["inat:154644100"]
+    result = refresh_mycomap_tip_labels(_state(), [_ORIGINAL_TIP], refresh)
+    assert result["changes"] == []
+    assert result["settled_tips"] == []
+
+
+def test_versioned_or_genbank_compact_mo_is_not_an_observation():
+    from app.services.tree_edit_service import tip_observation_reference
+
+    assert tip_observation_reference("MO123456.1 Amanita muscaria") is None
+    assert tip_observation_reference(
+        "MO123456 Amanita muscaria", "", {"source": "genbank"}) is None
+    # Explicit and trusted forms still count.
+    assert tip_observation_reference("MO123456 Amanita muscaria") == "mo:123456"
+    assert tip_observation_reference("mo:123456 Amanita", "", {"source": "genbank"}) == "mo:123456"

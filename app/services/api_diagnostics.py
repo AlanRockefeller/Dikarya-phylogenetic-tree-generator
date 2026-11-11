@@ -76,8 +76,11 @@ def _archive_directory(now):
                 logger.warning(
                     "event=api.archive_group_unshared directory=%s gid=%s expected_gid=%s "
                     "(other accounts cannot write this day's archives; "
-                    "run chmod g+s on %s)",
-                    directory.name, directory.stat().st_gid, shared_gid, ARCHIVE_DIR,
+                    "repair it with: chgrp -R %s %s && chmod 2770 %s && "
+                    "find %s -type f -exec chmod g+rw {} +; "
+                    "and chmod g+s %s so new days inherit the group)",
+                    directory.name, directory.stat().st_gid, shared_gid,
+                    shared_gid, directory, directory, directory, ARCHIVE_DIR,
                 )
         except OSError:
             pass

@@ -277,7 +277,7 @@ def _raise_refresh_http_error(path, exc, key):
         raise OrgResultError(
             "MycoMap.org rejected the request"
             + (f" ({detail})" if detail else "")
-            + ". An observation must be written inat:<id>, mo:<id> or mp:<id>.",
+            + ". An observation must be written inat:<id> or mo:<id>.",
             400, retryable=False,
         ) from exc
     raise OrgResultError(

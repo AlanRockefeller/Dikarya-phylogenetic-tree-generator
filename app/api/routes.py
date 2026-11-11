@@ -3752,10 +3752,7 @@ def refresh_tree_mycomap_records(job_id):
     job_dir = Config.JOB_DIR / job_id
     from app.services.mycomap_service import MycoMapRefreshError, MycoMapRefreshRateLimited
     try:
-        from app.services.mycomap_service import (
-            extract_mycomap_observation_reference,
-            refresh_mycomap_observation_records,
-        )
+        from app.services.mycomap_service import refresh_mycomap_observation_records
         from app.services.tree_edit_service import (
             _tree_tip_set,
             load_tree_state,
@@ -3763,6 +3760,7 @@ def refresh_tree_mycomap_records(job_id):
             refresh_mycomap_tip_labels,
             refresh_sequence_metadata_names,
             save_tree_state,
+            tip_observation_reference,
             tree_state_lock,
         )
 
@@ -3777,10 +3775,10 @@ def refresh_tree_mycomap_records(job_id):
         renames = state.get("renames") or {}
         references = []
         for name in normalized_tip_names:
-            reference = (
-                extract_mycomap_observation_reference(name)
-                or extract_mycomap_observation_reference(renames.get(name))
-            )
+            # A versioned MO123456.1 is a GenBank accession, not a Mushroom
+            # Observer record; the in-lock label update also checks the saved
+            # provenance and skips any tip whose source says GenBank.
+            reference = tip_observation_reference(name, renames.get(name))
             if reference and reference not in references:
                 references.append(reference)
         if not references:
@@ -3825,6 +3823,7 @@ def refresh_tree_mycomap_records(job_id):
             # pipeline is live, because the worker rewrites input_info.json
             # from memory without this lock and one write would erase the other.
             metadata_changes = []
+            metadata_warnings = []
             # The status check_job_access read is from before the network
             # refresh; a recompute may have been queued since, so re-read it.
             if job is not None:
@@ -3848,6 +3847,9 @@ def refresh_tree_mycomap_records(job_id):
                         "Refreshed tree labels were saved, but input_info.json "
                         "sequence_metadata could not be updated", job=job_id,
                         error=type(exc).__name__)
+                    metadata_warnings.append(
+                        "Tree labels were updated, but the job's saved sequence "
+                        "details still list the old names.")
         return jsonify({
             "status": "success",
             "refreshed_count": max(
@@ -3855,7 +3857,8 @@ def refresh_tree_mycomap_records(job_id):
             "updated_tip_count": len(changes),
             "changes": changes,
             "metadata_changes": metadata_changes,
-            "warnings": list(refresh_result.get("warnings") or []) + label_result["warnings"],
+            "warnings": (list(refresh_result.get("warnings") or []) + label_result["warnings"]
+                         + metadata_warnings),
             "message": refresh_result.get("message") or "",
         })
     except MycoMapRefreshRateLimited as exc:

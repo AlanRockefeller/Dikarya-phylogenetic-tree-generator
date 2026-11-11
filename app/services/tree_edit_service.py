@@ -1030,6 +1030,14 @@ def _replace_old_name(label: str, candidates: List[str],
     """
     protected = [m.span() for m in re.finditer(_phrase_pattern(new_value), label,
                                                 flags=re.IGNORECASE)]
+    old_spans = [m.span() for old_value in candidates
+                 for m in re.finditer(_phrase_pattern(old_value), label, flags=re.IGNORECASE)]
+    # The label already shows the new name on its own (not merely as part of a
+    # longer old name such as "X y var. z"): it is current, and any old name
+    # beside it is the user's own note -- "X y (was X z)" must stay as written.
+    if any(not any(o_start <= p_start and p_end <= o_end for o_start, o_end in old_spans)
+           for p_start, p_end in protected):
+        return label, False
     for old_value in sorted(candidates, key=len, reverse=True):
         for match in re.finditer(_phrase_pattern(old_value), label, flags=re.IGNORECASE):
             start, end = match.span()
@@ -1038,6 +1046,29 @@ def _replace_old_name(label: str, candidates: List[str],
             updated = label[:start] + new_value + label[end:]
             return " ".join(updated.split()).strip(), True
     return label, False
+
+
+def tip_observation_reference(original_name: str, current_label: str = "",
+                              metadata: Optional[Dict] = None) -> Optional[str]:
+    """The observation a tip names, or None.
+
+    ``MO123456`` is both a Mushroom Observer label and a GenBank accession, so
+    the compact form is honoured only when the record's provenance is not
+    GenBank (record_provenance: an NCBI/GenBank source, or a version suffix
+    such as ``MO123456.1``). Explicit forms (``mo:123456``, iNat ids) always
+    count. Unknown provenance keeps the compact form: that is how a label typed
+    or pasted into the Tree Builder names a Mushroom Observer record.
+    """
+    from app.services.mycomap_service import extract_mycomap_observation_reference
+    from app.services.sequence_dedup_service import record_provenance
+
+    allow_compact = record_provenance(original_name, metadata) != "genbank"
+    for value in (original_name, current_label):
+        reference = extract_mycomap_observation_reference(
+            str(value or ""), allow_compact_mo=allow_compact)
+        if reference:
+            return reference
+    return None
 
 
 def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
@@ -1052,7 +1083,6 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
     was built with, from sequence_metadata. A label that already shows the new
     value is up to date; one that holds neither is left alone and reported.
     """
-    from app.services.mycomap_service import extract_mycomap_observation_reference
 
     selected = []
     seen = set()
@@ -1079,6 +1109,7 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
     collect_original_names(tree_json.get("tree_structure") or {})
     before_records = refresh_result.get("before") or {}
     after_records = refresh_result.get("after") or {}
+    not_refreshed = set(refresh_result.get("not_refreshed") or [])
     renames = tree_json.get("renames") or {}
     changes = []
     warnings = []
@@ -1092,18 +1123,20 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
             warnings.append(f"Tree tip is no longer available: {original_name[:120]}")
             continue
         current_label = str(renames.get(original_name) or original_name)
-        reference = (
-            extract_mycomap_observation_reference(original_name)
-            or extract_mycomap_observation_reference(current_label)
-        )
+        metadata = _metadata_for_tip(sequence_metadata, original_name) or {}
+        reference = tip_observation_reference(original_name, current_label, metadata)
         if not reference:
+            continue
+        if reference in not_refreshed:
+            # Already named in the refresh warnings. MycoMap's stored record
+            # may still come back in "after", but it was not refreshed, so it
+            # must not rewrite the label (or, later, the stored taxon).
             continue
         before = before_records.get(reference) or {}
         after = after_records.get(reference) or {}
         if not after.get("found"):
             warnings.append(f"MycoMap did not return refreshed details for {reference}.")
             continue
-        metadata = _metadata_for_tip(sequence_metadata, original_name) or {}
 
         updated_label = current_label
         changed_fields = []
@@ -1184,7 +1217,6 @@ def refresh_sequence_metadata_names(job_dir: Path, input_info: Optional[Dict],
     queued or running (that write would erase this one, or this one its). The
     MycoMap NCBI reconcile, which runs on finished jobs, does take the lock.
     """
-    from app.services.mycomap_service import extract_mycomap_observation_reference
 
     if not isinstance(input_info, dict):
         return []
@@ -1192,10 +1224,13 @@ def refresh_sequence_metadata_names(job_dir: Path, input_info: Optional[Dict],
     if not isinstance(metadata, list):
         return []
     after_records = refresh_result.get("after") or {}
+    not_refreshed = set(refresh_result.get("not_refreshed") or [])
     changes = []
     for original_name in dict.fromkeys(str(n or "").strip() for n in tip_names):
         entry = _metadata_for_tip(metadata, original_name)
-        reference = extract_mycomap_observation_reference(original_name)
+        reference = tip_observation_reference(original_name, "", entry)
+        if reference in not_refreshed:
+            continue
         after = after_records.get(reference) or {} if reference else {}
         new_name = " ".join(str(after.get("scientific_name") or "").split())
         if not entry or not after.get("found") or not new_name:

@@ -4202,11 +4202,12 @@ def reserve_review_refresh(requester: str, job_id: str):
          max(1, int(getattr(Config, "CLAUDE_REVIEW_MAX_REFRESHES_PER_JOB", 3))),
          "This tree's Claude review has been re-run as often as allowed today."),
     )
+    client = None
+    taken = []
     try:
         from app.workers.queue import get_redis_connection
 
         client = get_redis_connection()
-        taken = []
         try:
             for key, limit, message in limits:
                 current = int(client.incr(key))
@@ -4233,6 +4234,13 @@ def reserve_review_refresh(requester: str, job_id: str):
         raise
     except Exception as exc:
         logger.warning("Claude review refresh guard unavailable: %s", exc)
+        # Give back what was already counted (e.g. INCR worked, EXPIRE did
+        # not): no review ran. Best effort; the original error is reported.
+        for key in taken:
+            try:
+                client.decr(key)
+            except Exception:
+                break
         raise TreeAnalysisUnavailable(
             "Re-running the Claude review is temporarily unavailable."
         ) from exc

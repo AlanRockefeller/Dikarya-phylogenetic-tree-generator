@@ -257,11 +257,15 @@ def test_graceful_restart_is_bulk_only_and_accepts_no_arguments(graceful_guard):
 
 def test_crash_looping_voucher_unit_does_not_block_restart(capsys):
     guard = load_guard()
-    # high2 inactive; voucher activating in auto-restart; then dikarya-worker's shutdown config.
-    inspect = ["inactive", "activating", "auto-restart", "mixed", "infinity"]
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", return_value=json.dumps({"jobs": []})), patch.object(guard.subprocess, "run") as mutate:
+    # high2 inactive; voucher activating in auto-restart; then both units' shutdown config.
+    inspect = ["inactive", "activating", "auto-restart", "mixed", "infinity", "mixed", "infinity"]
+    reports = [json.dumps({"queue": "phylo_high", "pending": 0, "jobs": []}),
+               json.dumps({"queue": "voucher_sync", "pending": 0, "jobs": []})]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports) as report, patch.object(guard.subprocess, "run") as mutate:
         assert guard.main() == 0
-        mutate.assert_called_once_with(["/usr/bin/systemctl", "restart", "--no-block", "dikarya-worker.service"], check=True)
+        # Its queue is still reported, and it is restarted by name.
+        assert [call.args[0][-1] for call in report.call_args_list] == ["phylo_high", "voucher_sync"]
+        mutate.assert_called_once_with(["/usr/bin/systemctl", "restart", "--no-block", "dikarya-worker.service", "dikarya-worker-voucher.service"], check=True)
     assert "crash-looping" in capsys.readouterr().out
 
 
@@ -270,3 +274,25 @@ def test_activating_voucher_unit_that_is_not_crash_looping_still_refuses():
     with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "activating", "start"]), patch.object(guard.subprocess, "run") as mutate:
         assert guard.main() == 78
         mutate.assert_not_called()
+
+
+def test_crash_looping_unit_without_graceful_dropin_refuses():
+    guard = load_guard()
+    inspect = ["inactive", "activating", "auto-restart", "mixed", "infinity", "control-group", "90s"]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch.object(guard.subprocess, "run") as mutate:
+        assert guard.main() == 78
+        mutate.assert_not_called()
+
+
+def test_running_voucher_apply_is_never_offered_for_interrupt(capsys):
+    guard = load_guard()
+    inspect = ["inactive", "active", "mixed", "infinity", "mixed", "infinity"]
+    reports = [json.dumps({"queue": "phylo_high", "pending": 0, "jobs": []}),
+               json.dumps({"queue": "voucher_sync", "pending": 0,
+                           "jobs": [{"id": "42", "description": "voucher sync apply", "interruptible": False}]})]
+    stream = io.StringIO("INTERRUPT 42\n")
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+        assert guard.main() == 75
+        mutate.assert_not_called()
+    out = capsys.readouterr().out
+    assert "cannot be interrupted" in out and "INTERRUPT 42" not in out

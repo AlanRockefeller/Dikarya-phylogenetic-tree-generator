@@ -465,16 +465,15 @@ class ActorScorer:
         # 2026-11-08 12:04, on a bare /health check). Use the store the
         # after-counts came from; when Redis answered without before-counts
         # (an older script), keep the previous behaviour.
+        # Decide "raised" within ONE store, comparing its own before and
+        # after. Redis's pair comes from one atomic script, so exactly one of
+        # two concurrent requests sees the rise; merging in the per-process
+        # fallback's before-counts (updated outside that atomicity) let both
+        # see the other's add and both skip the alert.
         if shared is not None:
-            before = shared_before
-            if before is not None:
-                before = {**local_before, **{
-                    name: max(local_before.get(name, 0), value)
-                    for name, value in before.items()
-                }}
-        else:
-            before = local_before
-        if before is not None and score <= score_signals(before):
+            if shared_before is not None and score_signals(shared) <= score_signals(shared_before):
+                return None
+        elif score <= score_signals(local_before):
             return None
         if not self._claim_alert(actor):
             return None
