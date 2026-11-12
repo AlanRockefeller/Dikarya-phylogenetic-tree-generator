@@ -3754,6 +3754,7 @@ def refresh_tree_mycomap_records(job_id):
     try:
         from app.services.mycomap_service import refresh_mycomap_observation_records
         from app.services.tree_edit_service import (
+            _metadata_for_tip,
             _tree_tip_set,
             load_tree_state,
             read_input_info,
@@ -3773,12 +3774,18 @@ def refresh_tree_mycomap_records(job_id):
             }), 409
 
         renames = state.get("renames") or {}
+        # Resolve each tip with its saved sequence_metadata row BEFORE the
+        # remote refresh: an unversioned MO123456 whose source says GenBank is
+        # an accession, and must never refresh observation mo:123456 on
+        # MycoMap. (The commit below re-reads input_info.json under the lock,
+        # because the file can change during the network call.)
+        resolve_metadata = (read_input_info(job_dir) or {}).get("sequence_metadata")
+        if not isinstance(resolve_metadata, list):
+            resolve_metadata = []
         references = []
         for name in normalized_tip_names:
-            # A versioned MO123456.1 is a GenBank accession, not a Mushroom
-            # Observer record; the in-lock label update also checks the saved
-            # provenance and skips any tip whose source says GenBank.
-            reference = tip_observation_reference(name, renames.get(name))
+            reference = tip_observation_reference(
+                name, renames.get(name), _metadata_for_tip(resolve_metadata, name))
             if reference and reference not in references:
                 references.append(reference)
         if not references:

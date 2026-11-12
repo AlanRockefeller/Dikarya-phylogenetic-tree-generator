@@ -26,7 +26,7 @@
 # the password going live and the web restart finishing.
 #
 # Rollback for step 3 (as root):
-#     redis-cli -a "$PW" CONFIG SET requirepass ""        # PW from the env file
+#     REDISCLI_AUTH="$PW" redis-cli --no-auth-warning CONFIG SET requirepass ""   # PW from the env file
 #     cp the *.bak-<stamp> backups printed below back over the originals
 #     systemctl restart dikarya-worker dikarya-worker-bulk dikarya-metrics
 #     /usr/local/sbin/restart-dikarya-web
@@ -72,7 +72,12 @@ if cmp -s "$APP/ops/nginx/dikarya" "$SITE"; then
     # nginx on the old configuration, and a re-run must not skip that.
     echo "   already installed"
     if (( ! DRY )); then
-        nginx -t && systemctl reload nginx && echo "   nginx reloaded"
+        # Explicit check: set -e does not stop on a failing && chain.
+        if ! nginx -t || ! systemctl reload nginx; then
+            echo "   nginx -t or reload FAILED; nginx may still run the old configuration" >&2
+            exit 1
+        fi
+        echo "   nginx reloaded"
     fi
 else
     backup "$SITE"
@@ -219,14 +224,17 @@ for attempt in $(seq 1 30); do
     inactive=0
     for u in "${units[@]}"; do [[ "$(systemctl is-active "$u")" == active ]] || inactive=1; done
     registered=$(REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -n "$db" SCARD rq:workers)
-    (( inactive == 0 && registered >= 4 )) && break
+    # The total counts every worker, so a stale registration can stand in for
+    # a voucher worker that never started; require one on voucher_sync itself.
+    voucher=$(REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -n "$db" SCARD rq:workers:voucher_sync)
+    (( inactive == 0 && registered >= 4 && voucher >= 1 )) && break
     sleep 2
 done
 for u in "${units[@]}"; do
     printf '   %-24s %s\n' "$u" "$(systemctl is-active "$u")"
 done
-echo "   RQ workers registered: $registered (expect 4)"
+echo "   RQ workers registered: $registered (expect 4), on voucher_sync: $voucher (expect 1)"
 echo "   web-restart=$web worker-restart=$wrk bulk-restart=$bulk metrics-restart=$met (0 = ok; web 69/70/75: see CLAUDE.md table; worker 75 = busy, re-run that wrapper)"
-(( web == 0 && wrk == 0 && bulk == 0 && met == 0 && inactive == 0 && registered >= 4 )) || exit 1
+(( web == 0 && wrk == 0 && bulk == 0 && met == 0 && inactive == 0 && registered >= 4 && voucher >= 1 )) || exit 1
 echo
 echo "Done. The tree account can now run:  set -a; . ~/.dikarya/redis.env; set +a; redis-cli LLEN rq:queue:phylo_high"
