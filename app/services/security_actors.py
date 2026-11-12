@@ -462,18 +462,28 @@ class ActorScorer:
         # the line keeps that score for the whole window, so without this any
         # later request that recorded only zero-weight or saturated signals
         # re-escalated it as soon as the cooldown ran out (127.0.0.0/24,
-        # 2026-11-08 12:04, on a bare /health check). Use the store the
-        # after-counts came from; when Redis answered without before-counts
-        # (an older script), keep the previous behaviour.
-        # Decide "raised" within ONE store, comparing its own before and
-        # after. Redis's pair comes from one atomic script, so exactly one of
-        # two concurrent requests sees the rise; merging in the per-process
-        # fallback's before-counts (updated outside that atomicity) let both
-        # see the other's add and both skip the alert.
-        if shared is not None:
-            if shared_before is not None and score_signals(shared) <= score_signals(shared_before):
-                return None
-        elif score <= score_signals(local_before):
+        # 2026-11-08 12:04, on a bare /health check).
+        # Whether this request raised it is judged two ways
+        # accepted if EITHER says so:
+        #   * Redis's own before/after pair, from one atomic script, so exactly
+        #     one of two concurrent requests sees a Redis-side rise (merging the
+        #     per-process before-counts into it let both see each other's add
+        #     and both skip the alert);
+        #   * the merged counts, so a crossing made of tokens the fallback held
+        #     during a Redis outage is not lost when Redis alone stays flat.
+        # A duplicate is not a risk: _claim_alert's SET NX lets one through
+        # per cooldown. When Redis answered without before-counts (an older
+        # script), keep the previous behaviour and alert.
+        if shared is not None and shared_before is None:
+            raised = True
+        else:
+            merged_before = dict(local_before)
+            for name, value in (shared_before or {}).items():
+                merged_before[name] = max(merged_before.get(name, 0), value)
+            raised = score > score_signals(merged_before)
+            if shared is not None and score_signals(shared) > score_signals(shared_before):
+                raised = True
+        if not raised:
             return None
         if not self._claim_alert(actor):
             return None

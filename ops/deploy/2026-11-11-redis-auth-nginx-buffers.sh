@@ -214,9 +214,19 @@ set -e
 
 # --------------------------------------------------------------------------
 say "verification"
-redis-cli ping 2>&1 | grep -q NOAUTH && echo "   ok: unauthenticated redis-cli is refused" \
-    || echo "   WARNING: unauthenticated redis-cli was NOT refused" >&2
-REDISCLI_AUTH="$pw" redis-cli --no-auth-warning ping | grep -q PONG && echo "   ok: password works"
+# Both are mandatory: the point of this step is that Redis refuses
+# unauthenticated commands, so "Done" must never print without it.
+auth_ok=1
+if redis-cli -n "$db" ping 2>&1 | grep -q NOAUTH; then
+    echo "   ok: unauthenticated redis-cli is refused"
+else
+    echo "   FAILED: unauthenticated redis-cli was NOT refused" >&2; auth_ok=0
+fi
+if REDISCLI_AUTH="$pw" redis-cli --no-auth-warning -n "$db" ping | grep -q PONG; then
+    echo "   ok: password works"
+else
+    echo "   FAILED: the new password was not accepted" >&2; auth_ok=0
+fi
 # Bounded wait for every expected unit to be active and its RQ worker
 # registered; "Done" only when both hold.
 units=(dikarya-web dikarya-worker dikarya-worker-high2 dikarya-worker-voucher dikarya-worker-bulk dikarya-metrics)
@@ -235,6 +245,18 @@ for u in "${units[@]}"; do
 done
 echo "   RQ workers registered: $registered (expect 4), on voucher_sync: $voucher (expect 1)"
 echo "   web-restart=$web worker-restart=$wrk bulk-restart=$bulk metrics-restart=$met (0 = ok; web 69/70/75: see CLAUDE.md table; worker 75 = busy, re-run that wrapper)"
-(( web == 0 && wrk == 0 && bulk == 0 && met == 0 && inactive == 0 && registered >= 4 && voucher >= 1 )) || exit 1
+# Units a refused (75) or failed restart left on the OLD environment: the
+# password is already live, so any new Redis connection they open is refused.
+stale=()
+(( wrk == 0 )) || stale+=(dikarya-worker dikarya-worker-high2 dikarya-worker-voucher)
+(( bulk == 0 )) || stale+=(dikarya-worker-bulk)
+(( met == 0 )) || stale+=(dikarya-metrics)
+if (( ${#stale[@]} )); then
+    echo "   NOT RESTARTED: ${stale[*]}" >&2
+    echo "   These still run with the old unauthenticated REDIS_URL while Redis now" >&2
+    echo "   requires the password, so they can fail to reconnect. Re-run this script" >&2
+    echo "   (or the matching restart wrapper) as soon as the queues are empty." >&2
+fi
+(( auth_ok == 1 && web == 0 && wrk == 0 && bulk == 0 && met == 0 && inactive == 0 && registered >= 4 && voucher >= 1 )) || exit 1
 echo
 echo "Done. The tree account can now run:  set -a; . ~/.dikarya/redis.env; set +a; redis-cli LLEN rq:queue:phylo_high"

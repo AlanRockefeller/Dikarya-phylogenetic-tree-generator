@@ -3845,7 +3845,7 @@ def refresh_tree_mycomap_records(job_id):
                 try:
                     metadata_changes = refresh_sequence_metadata_names(
                         job_dir, input_info, label_result.get("settled_tips") or [],
-                        refresh_result)
+                        refresh_result, label_result.get("settled_references") or {})
                 except Exception as exc:
                     from app.services.log_context import log_degradation
                     logger.debug("refresh metadata update failed", exc_info=True)

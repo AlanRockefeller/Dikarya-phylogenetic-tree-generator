@@ -771,3 +771,26 @@ def test_tip_refresh_updates_a_mafft_reversed_tip():
         state, [reversed_tip], _refresh_fixture("Podaxis inyoensis", "Podaxis pistillaris"))
     assert result["changes"][0]["new_name"] == (
         "_R_iNat154644100 Podaxis pistillaris Death Valley California US RiC 62")
+
+
+def test_metadata_update_uses_the_reference_read_from_the_saved_label(tmp_path):
+    from app.services.tree_edit_service import (
+        read_input_info,
+        refresh_mycomap_tip_labels,
+        refresh_sequence_metadata_names,
+    )
+
+    # The original name carries no observation id; only the saved label does.
+    original = "sample_1"
+    (tmp_path / "input_info.json").write_text(json.dumps({"sequence_metadata": [
+        {"name": original, "taxon": "Podaxis inyoensis"}]}))
+    state = {"tree_structure": {"children": [{"name": original}, {"name": "other"}]},
+             "renames": {original: "inat:154644100 Podaxis inyoensis"}}
+    refresh = _refresh_fixture("Podaxis inyoensis", "Podaxis pistillaris")
+    labels = refresh_mycomap_tip_labels(state, [original], refresh,
+                                        read_input_info(tmp_path)["sequence_metadata"])
+    assert labels["settled_references"] == {original: "inat:154644100"}
+    changes = refresh_sequence_metadata_names(
+        tmp_path, read_input_info(tmp_path), labels["settled_tips"], refresh,
+        labels["settled_references"])
+    assert [c["new_taxon"] for c in changes] == ["Podaxis pistillaris"]

@@ -1117,6 +1117,7 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
     # Only these may have their stored taxon moved on: for any other tip the
     # old taxon is the only record of what to replace on a later refresh.
     settled = []
+    settled_refs = {}
 
     for original_name in selected:
         if original_name not in original_tip_names:
@@ -1127,6 +1128,7 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
         reference = tip_observation_reference(original_name, current_label, metadata)
         if not reference:
             continue
+        settled_refs[original_name] = reference
         if reference in not_refreshed:
             # Already named in the refresh warnings. MycoMap's stored record
             # may still come back in "after", but it was not refreshed, so it
@@ -1187,6 +1189,10 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
         "changes": changes,
         "warnings": warnings,
         "settled_tips": list(dict.fromkeys(settled)),
+        # The observation each settled tip was resolved to here, which may
+        # have come from its saved label rather than its original name;
+        # refresh_sequence_metadata_names() must use the same one.
+        "settled_references": {name: settled_refs[name] for name in settled},
     }
 
 
@@ -1202,7 +1208,8 @@ def read_input_info(job_dir: Path) -> Optional[Dict]:
 
 def refresh_sequence_metadata_names(job_dir: Path, input_info: Optional[Dict],
                                     tip_names: List[str],
-                                    refresh_result: Dict) -> List[Dict]:
+                                    refresh_result: Dict,
+                                    references: Optional[Dict[str, str]] = None) -> List[Dict]:
     """Record refreshed MycoMap names in input_info.json's sequence_metadata.
 
     Alan 11/11/26 - Only ``taxon`` changes; the name the job was built with is
@@ -1210,7 +1217,9 @@ def refresh_sequence_metadata_names(job_dir: Path, input_info: Optional[Dict],
     entry in tree_state and is what the Newick/FASTA/alignment files carry, is
     deliberately left alone. ``tip_names`` must be the ``settled_tips`` of
     refresh_mycomap_tip_labels(), and ``input_info`` the dict read_input_info()
-    returned under the same tree_state_lock. Returns the changes.
+    returned under the same tree_state_lock, and ``references`` its
+    ``settled_references`` (a reference read from a saved label cannot be
+    re-derived from the original name alone). Returns the changes.
 
     The pipeline worker rewrites input_info.json from its in-memory params
     without this lock, so the caller must not call this while the job is
@@ -1228,7 +1237,8 @@ def refresh_sequence_metadata_names(job_dir: Path, input_info: Optional[Dict],
     changes = []
     for original_name in dict.fromkeys(str(n or "").strip() for n in tip_names):
         entry = _metadata_for_tip(metadata, original_name)
-        reference = tip_observation_reference(original_name, "", entry)
+        reference = ((references or {}).get(original_name)
+                     or tip_observation_reference(original_name, "", entry))
         if reference in not_refreshed:
             continue
         after = after_records.get(reference) or {} if reference else {}

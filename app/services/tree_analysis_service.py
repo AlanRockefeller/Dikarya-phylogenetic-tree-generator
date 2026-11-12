@@ -4175,6 +4175,17 @@ def _reserve_daily_review() -> None:
         ) from exc
 
 
+def _give_back(client, taken: list) -> None:
+    """Decrement each reserved key once, dropping it from ``taken`` as it goes.
+
+    A key leaves the list only after its DECR succeeded, so a rollback that
+    fails partway and is retried never decrements the same key twice.
+    """
+    while taken:
+        client.decr(taken[-1])
+        taken.pop()
+
+
 def reserve_review_refresh(requester: str, job_id: str):
     """Spend one forced re-run from this requester's and this job's daily cap.
 
@@ -4219,14 +4230,12 @@ def reserve_review_refresh(requester: str, job_id: str):
                         message + " New re-runs reset at 00:00 UTC; the saved review "
                         "is still available.", retry_after)
         except TreeAnalysisRateLimited:
-            for key in taken:
-                client.decr(key)
+            _give_back(client, taken)
             raise
 
         def refund() -> None:
             try:
-                for key in taken:
-                    client.decr(key)
+                _give_back(client, taken)
             except Exception as exc:  # best effort; the budget resets daily
                 logger.warning("Claude review refresh refund failed: %s", exc)
         return refund
@@ -4234,13 +4243,13 @@ def reserve_review_refresh(requester: str, job_id: str):
         raise
     except Exception as exc:
         logger.warning("Claude review refresh guard unavailable: %s", exc)
-        # Give back what was already counted (e.g. INCR worked, EXPIRE did
-        # not): no review ran. Best effort; the original error is reported.
-        for key in taken:
-            try:
-                client.decr(key)
-            except Exception:
-                break
+        # Give back what is still counted (e.g. INCR worked, EXPIRE did not,
+        # or the rate-limit rollback above failed partway): no review ran.
+        # Best effort; the original error is reported.
+        try:
+            _give_back(client, taken)
+        except Exception:
+            pass
         raise TreeAnalysisUnavailable(
             "Re-running the Claude review is temporarily unavailable."
         ) from exc
