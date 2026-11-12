@@ -1898,6 +1898,8 @@
                     // Alan 9/24/26 - Re-add the type-specimen badge after phylotree rewrites the label.
                     this._decorateTypeSpecimen(element, node);
                     this._decorateDirtyRead(element, node);
+                    // Alan 11/11/26 - Give the label its saved font now; drawNode just reset it.
+                    this._sizeTipLabel(element, node);
                     // Alan 9/23/26 - Runs after phylotree (re)draws each node, so a polytomy
                     // connector follows every update() without a separate pass.
                     this._drawPolytomyConnector(element, node);
@@ -1919,6 +1921,12 @@
             try {
                 const renderer = this.tree.render(renderOpts);
 
+                // Alan 11/11/26 - Every display.update() rewrites each tip label in phylotree's own
+                // default style (14px, dx 4.62), so each relayout painted wider labels for a frame
+                // and the fit measured the wrong ones. The saved sizing is now re-applied per label
+                // from the node-styler (_sizeTipLabel), inside phylotree's own pass, rather than by
+                // wrapping update() to restyle every tip and support label after each call.
+
                 // Alan 7/14/26 - Expose visible selected tips to the native source-record menu for bulk observation links.
                 if (renderer) renderer.recordTargetNodesProvider = () => this.getSelectedNodes();
 
@@ -1927,10 +1935,22 @@
                     else if (renderer.svg) this.container.appendChild(renderer.svg.node());
                 }
 
+                // Alan 11/11/26 - Give the labels their final font BEFORE the width is measured
+                // and settled. They used to get it 150ms later, from _addSupportLabels, so every
+                // load painted at phylotree's default size, jumped to the saved size, then
+                // re-fitted the width once more -- two visible jumps after the first paint.
+                const initialSvg = window.d3v7.select(this.container).select("svg");
+                if (!initialSvg.empty()) {
+                    this.cachedZoomNode = this._findZoomGroup(initialSvg).node() || initialSvg.node();
+                    this._applyTextSizingFromZoom();
+                }
+
                 // Apply spacing via phylotree's native API
                 this._applySpacingViaAPI();
 
-                this.supportLabelsTimer = setTimeout(() => this._addSupportLabels(), 150);
+                // Alan 11/11/26 - Support values in the same pass, now that relayouts are not
+                // animated ('transitions': false), instead of appearing 150ms after the tree.
+                this._addSupportLabels();
                 this._attachEventHandlers();
 
                 // Hook into phylotree's native selection system
@@ -2102,17 +2122,47 @@
         }
 
         // Measure what was just drawn and, if the fit is off, lay it out once more.
+        // Alan 11/11/26 - Solve the fit in one go, synchronously. The measured label width is
+        // the rightmost label's end minus the branch width, but that label is often on a
+        // shallower tip than the deepest one, so it moves less than the branches widen and a
+        // single correction undershoots. The rest used to be made by the deferred fit checks,
+        // one 80ms step at a time after the first paint -- every load visibly jumped the tip
+        // labels to the right two or three times. A secant step is exact once one label
+        // dominates (the extent is linear in the width), so this settles in 2-3 updates.
         _settleFittedWidth(display) {
             if (this.options.layout === 'radial') return;
-            const measured = this._measureNonBranchWidth(display);
-            if (!Number.isFinite(measured)) return;
-            this._nonBranchWidthPx = measured;
-            const target = this._targetBranchWidth();
-            // Alan 11/8/26 - Compare and write in drawn pixels (PHYLOTREE_RECT_DEPTH_SCALE).
-            const drawn = (Number(display.options['branch-width']) || 0) * PHYLOTREE_RECT_DEPTH_SCALE;
-            if (Math.abs(target - drawn) <= 2) return;
-            display.options['branch-width'] = target / PHYLOTREE_RECT_DEPTH_SCALE;
-            display.update();
+            const drawn = () => (Number(display.options['branch-width']) || 0) * PHYLOTREE_RECT_DEPTH_SCALE;
+            const residual = () => {
+                const measured = this._measureNonBranchWidth(display);
+                if (!Number.isFinite(measured)) return NaN;
+                this._nonBranchWidthPx = measured;
+                // Alan 11/8/26 - Compare and write in drawn pixels (PHYLOTREE_RECT_DEPTH_SCALE).
+                return this._targetBranchWidth() - drawn();
+            };
+            const redrawAnnotations = this.cladeAnnotations.length > 0 && this._annotationsDrawn;
+            let x0 = drawn();
+            let g0 = residual();
+            if (!Number.isFinite(g0) || Math.abs(g0) <= 2) return;
+            let x1 = x0 + g0;
+            for (let step = 0; step < 4; step += 1) {
+                const width = Math.max(1, Math.min(MAX_BRANCH_WIDTH_PX, x1));
+                // Alan 11/11/26 - Stop when the clamp pins the width where it already is: every
+                // further step would redraw the whole tree at the same width for nothing.
+                if (Math.abs(width - drawn()) < 0.5) return;
+                display.options['branch-width'] = width / PHYLOTREE_RECT_DEPTH_SCALE;
+                display.update();
+                // Alan 11/11/26 - Annotations sit in the measured group, right of the labels;
+                // redraw them at the new layout or the next measurement reads them stale.
+                if (redrawAnnotations) this._renderCladeAnnotations();
+                x1 = drawn();
+                const g1 = residual();
+                if (!Number.isFinite(g1) || Math.abs(g1) <= 2) return;
+                const slope = g1 - g0;
+                const next = Math.abs(slope) > 1e-6 ? x1 - g1 * (x1 - x0) / slope : x1 + g1;
+                x0 = x1;
+                g0 = g1;
+                x1 = next;
+            }
         }
 
         // Labels reach their final font and annotations their final place only after a
@@ -2123,21 +2173,47 @@
             if (this._fitCheckTimer) clearTimeout(this._fitCheckTimer);
             this._fitCheckTimer = setTimeout(() => {
                 this._fitCheckTimer = null;
-                const display = this.tree?.display;
-                if (!display || this.options.layout === 'radial') return;
-                const measured = this._measureNonBranchWidth(display);
-                if (!Number.isFinite(measured)) return;
-                this._nonBranchWidthPx = measured;
-                // Alan 11/8/26 - Drawn pixels, like _targetBranchWidth().
-                const current = (Number(display.options['branch-width']) || 0) * PHYLOTREE_RECT_DEPTH_SCALE;
-                if (Math.abs(this._targetBranchWidth() - current) <= 4) {
-                    this._fitCorrections = 0;
-                    return;
-                }
-                this._fitCorrections = (this._fitCorrections || 0) + 1;
-                if (this._fitCorrections > 3) return;
-                this._relayoutHorizontal();
+                this._runFitCheck();
             }, 80);
+        }
+
+        // Alan 11/11/26 - The fit check's body, so settleLayoutNow() can run it at once.
+        _runFitCheck() {
+            const display = this.tree?.display;
+            if (!display || this.options.layout === 'radial') return false;
+            const measured = this._measureNonBranchWidth(display);
+            if (!Number.isFinite(measured)) return false;
+            this._nonBranchWidthPx = measured;
+            // Alan 11/8/26 - Drawn pixels, like _targetBranchWidth().
+            const current = (Number(display.options['branch-width']) || 0) * PHYLOTREE_RECT_DEPTH_SCALE;
+            if (Math.abs(this._targetBranchWidth() - current) <= 4) {
+                this._fitCorrections = 0;
+                return false;
+            }
+            this._fitCorrections = (this._fitCorrections || 0) + 1;
+            if (this._fitCorrections > 3) return false;
+            return this._relayoutHorizontal();
+        }
+
+        // Alan 11/11/26 - Run the deferred annotation draw and fit check now, so a page load's
+        // final layout is in its first paint. The controller calls this once the tree, saved
+        // renames, display prefs and annotations are all applied, before any network wait.
+        settleLayoutNow() {
+            if (!this.tree?.display) return;
+            if (this.annotationRedrawTimer) {
+                clearTimeout(this.annotationRedrawTimer);
+                this.annotationRedrawTimer = null;
+                this._renderCladeAnnotations();
+                this._applySupportFading();
+            }
+            if (this._fitCheckTimer) {
+                clearTimeout(this._fitCheckTimer);
+                this._fitCheckTimer = null;
+            }
+            if (this._runFitCheck() && (this.cladeAnnotations.length || this._annotationsDrawn)) {
+                this._renderCladeAnnotations();
+                this._applySupportFading();
+            }
         }
 
         // Apply horizontalPercent to the drawn tree without a full redraw.
@@ -4496,6 +4572,21 @@
             this._scheduleFitCheck();
         }
 
+        // Alan 11/11/26 - Per-node half of _applyTextSizingFromZoom, called from the node-styler
+        // with the factors that pass last computed, so a relayout keeps the saved tip font
+        // without a second full restyle of every label.
+        _sizeTipLabel(element, node) {
+            const sizing = this._tipTextSizing;
+            if (!sizing || !node || (node.children && node.children.length)) return;
+            const group = element && typeof element.node === 'function' ? element.node() : null;
+            const label = group && typeof group.querySelector === 'function'
+                ? group.querySelector('text.phylotree-node-text') : null;
+            if (!label) return;
+            label.style.fontSize = `${sizing.fontPx}px`;
+            label.setAttribute('dx', String(this._tipLabelDx(node, sizing.visualK)));
+            label.setAttribute('dy', String(1.9 / sizing.visualK));
+        }
+
         _applyTextSizingFromZoom() {
             if (!this.cachedZoomNode) return;
             const { k } = this._getSvgAndZoomGroup();
@@ -4521,6 +4612,8 @@
             const tipFontSvgPx = Math.max(1, tipBase / visualK);
             const supportFontSvgPx = Math.max(1, supportBase / visualK);
             const haloSvgPx = Math.max(0.75, 3 / visualK);
+            // Alan 11/11/26 - Remembered for _sizeTipLabel, which re-applies it on each relayout.
+            this._tipTextSizing = { fontPx: tipFontSvgPx, visualK };
 
             const svg = window.d3v7.select(this.container).select("svg");
 
@@ -8423,25 +8516,64 @@
             const inkClass = (base, isDefault) =>
                 isDefault ? `${base} clade-annotation-default-ink` : base;
 
-            // One annotation has one continuous bracket spanning all its members.
-            // Highlight bands still follow the individual member parts.
-            const singleTip = item.top === item.bottom;
-            entry.append('line')
-                .attr('class', inkClass('clade-annotation-line', item.style.line_color_is_default))
-                .attr('x1', laneX).attr('x2', laneX)
-                .attr('y1', singleTip ? item.top - tickHalf : item.top)
-                .attr('y2', singleTip ? item.bottom + tickHalf : item.bottom)
-                .style('stroke', item.style.line_color)
-                .style('stroke-width', `${lineWidth}px`)
-                .style('stroke-linecap', 'round');
+            // Alan 11/11/26 - One bracket segment per contiguous run of member rows. A selection
+            // annotation whose members are not adjacent (job cewq: three tips plus one 16 rows
+            // down) used to get a single line across every unrelated tip in between, reading as
+            // if they were members too. A contiguous annotation is one run, drawn as before.
+            const runs = this._annotationBracketRuns(item);
+            for (const run of runs) {
+                const singleTip = run.top === run.bottom;
+                entry.append('line')
+                    .attr('class', inkClass('clade-annotation-line', item.style.line_color_is_default))
+                    .attr('x1', laneX).attr('x2', laneX)
+                    .attr('y1', singleTip ? run.top - tickHalf : run.top)
+                    .attr('y2', singleTip ? run.bottom + tickHalf : run.bottom)
+                    .style('stroke', item.style.line_color)
+                    .style('stroke-width', `${lineWidth}px`)
+                    .style('stroke-linecap', 'round');
+            }
 
             // Alan 8/17/26 - Clade-line labels always use inherited ink without bubble handling.
+            // Alan 11/11/26 - With split runs the label sits beside the largest run (the first
+            // on a tie) rather than at the midpoint of the whole span, which can be a gap.
+            const labelRun = runs.length > 1
+                ? runs.reduce((best, run) => (run.size > best.size ? run : best), runs[0])
+                : null;
             this._appendAnnotationLabel(
                 entry, item, laneX + metrics.textX,
                 // Alan 8/17/26 - Use the clade-line text class after bubble drawing moved out.
-                inkClass('clade-annotation-label', item.style.text_color_is_default)
+                inkClass('clade-annotation-label', item.style.text_color_is_default),
+                labelRun ? { midY: (labelRun.top + labelRun.bottom) / 2 } : {}
             );
             return entry;
+        }
+
+        /**
+         * Alan 11/11/26 - Contiguous row runs of a clade annotation's bracket, top to bottom.
+         * Only a selection-mode annotation carries memberParts; its parts are complete clades,
+         * and parts whose rows touch are merged so adjacent sibling clades share one segment.
+         * Everything else (and the editor preview) is a single run from top to bottom.
+         */
+        _annotationBracketRuns(item) {
+            const whole = [{ top: item.top, bottom: item.bottom, size: (item.indices || []).length || 1 }];
+            const parts = Array.isArray(item.memberParts) ? item.memberParts
+                .filter(part => part.indices?.length && Number.isFinite(part.top) && Number.isFinite(part.bottom))
+                .slice().sort((a, b) => a.indices[0] - b.indices[0]) : [];
+            if (parts.length < 2) return whole;
+            const runs = [];
+            for (const part of parts) {
+                const first = part.indices[0];
+                const last = part.indices[part.indices.length - 1];
+                const prev = runs[runs.length - 1];
+                if (prev && first <= prev.lastIndex + 1) {
+                    prev.lastIndex = Math.max(prev.lastIndex, last);
+                    prev.bottom = Math.max(prev.bottom, part.bottom);
+                    prev.size += part.indices.length;
+                } else {
+                    runs.push({ top: part.top, bottom: part.bottom, lastIndex: last, size: part.indices.length });
+                }
+            }
+            return runs;
         }
 
         /**

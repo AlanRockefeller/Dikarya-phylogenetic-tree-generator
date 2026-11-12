@@ -262,6 +262,23 @@ Escalation = namedtuple("Escalation", "actor score counts")
 # ARGV -- window, then quads of (index, kind, cap, token) for each add.
 _RECORD_SCRIPT = """
 local window = tonumber(ARGV[1])
+local function current(key)
+    local kind = redis.call('TYPE', key)['ok']
+    if kind == 'set' then
+        return redis.call('SCARD', key)
+    elseif kind == 'string' then
+        return tonumber(redis.call('GET', key)) or 0
+    end
+    return 0
+end
+-- The counts before this request's additions follow the counts after them,
+-- so the caller can tell whether this request raised the score at all.
+local before = {}
+for n = 1, #KEYS do
+    before[n] = current(KEYS[n])
+end
+-- Only the keys this request adds to can change, so only they are re-read.
+local touched = {}
 local i = 2
 while i + 3 <= #ARGV do
     local idx = tonumber(ARGV[i])
@@ -269,6 +286,7 @@ while i + 3 <= #ARGV do
     local cap = tonumber(ARGV[i + 2])
     local token = ARGV[i + 3]
     local key = KEYS[idx]
+    touched[idx] = true
     if kind == 'd' then
         if cap <= 0 or redis.call('SCARD', key) < cap then
             redis.call('SADD', key, token)
@@ -283,14 +301,14 @@ while i + 3 <= #ARGV do
 end
 local out = {}
 for n = 1, #KEYS do
-    local kind = redis.call('TYPE', KEYS[n])['ok']
-    if kind == 'set' then
-        out[n] = redis.call('SCARD', KEYS[n])
-    elseif kind == 'string' then
-        out[n] = tonumber(redis.call('GET', KEYS[n])) or 0
+    if touched[n] then
+        out[n] = current(KEYS[n])
     else
-        out[n] = 0
+        out[n] = before[n]
     end
+end
+for n = 1, #KEYS do
+    out[#KEYS + n] = before[n]
 end
 return out
 """
@@ -312,11 +330,19 @@ class ActorFallback:
         self.lock = Lock()
 
     def record(self, actor, adds):
+        return self.record_with_before(actor, adds)[0]
+
+    def record_with_before(self, actor, adds):
+        """Like ``record``, also returning the counts before these adds."""
         with self.lock:
             now = monotonic()
             expires, counters = self.entries.pop(actor, (now + self.window, {}))
             if expires <= now:
                 expires, counters = now + self.window, {}
+            before = {
+                name: len(value) if isinstance(value, set) else int(value)
+                for name, value in counters.items()
+            }
             for name, token in adds:
                 signal = SIGNALS.get(name)
                 if signal is None:
@@ -333,7 +359,7 @@ class ActorFallback:
             return {
                 name: len(value) if isinstance(value, set) else int(value)
                 for name, value in counters.items()
-            }
+            }, before
 
     def alert_allowed(self, actor, cooldown):
         """True at most once per cooldown, so the fallback path is not chatty."""
@@ -373,7 +399,7 @@ class ActorScorer:
 
     def _redis_record(self, actor, adds):
         if self.redis_factory is None:
-            return None
+            return None, None
         client = self.redis_factory()
         argv = [self.window_seconds]
         for name, token in adds:
@@ -385,12 +411,20 @@ class ActorScorer:
                 token,
             ])
         keys = self._keys(actor)
-        raw = client.eval(_RECORD_SCRIPT, len(keys), *keys, *argv)
-        return {
+        raw = list(client.eval(_RECORD_SCRIPT, len(keys), *keys, *argv))
+        after = {
             name: int(value or 0)
             for name, value in zip(SIGNAL_ORDER, raw)
             if value
         }
+        before = None
+        if len(raw) == 2 * len(keys):
+            before = {
+                name: int(value or 0)
+                for name, value in zip(SIGNAL_ORDER, raw[len(keys):])
+                if value
+            }
+        return after, before
 
     def record(self, actor, signals):
         """Record signals for one actor; return an Escalation or None.
@@ -406,10 +440,10 @@ class ActorScorer:
         if not adds:
             return None
 
-        local = self.fallback.record(actor, adds)
-        shared = None
+        local, local_before = self.fallback.record_with_before(actor, adds)
+        shared = shared_before = None
         try:
-            shared = self._redis_record(actor, adds)
+            shared, shared_before = self._redis_record(actor, adds)
         except Exception as exc:  # noqa: BLE001 - any client/socket failure
             if self.on_error is not None:
                 try:
@@ -423,6 +457,33 @@ class ActorScorer:
 
         score = score_signals(counts)
         if score < self.threshold:
+            return None
+        # Alert only when this request raised the score. An actor already over
+        # the line keeps that score for the whole window, so without this any
+        # later request that recorded only zero-weight or saturated signals
+        # re-escalated it as soon as the cooldown ran out (127.0.0.0/24,
+        # 2026-11-08 12:04, on a bare /health check).
+        # Whether this request raised it is judged two ways
+        # accepted if EITHER says so:
+        #   * Redis's own before/after pair, from one atomic script, so exactly
+        #     one of two concurrent requests sees a Redis-side rise (merging the
+        #     per-process before-counts into it let both see each other's add
+        #     and both skip the alert);
+        #   * the merged counts, so a crossing made of tokens the fallback held
+        #     during a Redis outage is not lost when Redis alone stays flat.
+        # A duplicate is not a risk: _claim_alert's SET NX lets one through
+        # per cooldown. When Redis answered without before-counts (an older
+        # script), keep the previous behaviour and alert.
+        if shared is not None and shared_before is None:
+            raised = True
+        else:
+            merged_before = dict(local_before)
+            for name, value in (shared_before or {}).items():
+                merged_before[name] = max(merged_before.get(name, 0), value)
+            raised = score > score_signals(merged_before)
+            if shared is not None and score_signals(shared) > score_signals(shared_before):
+                raised = True
+        if not raised:
             return None
         if not self._claim_alert(actor):
             return None

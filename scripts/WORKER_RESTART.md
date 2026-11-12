@@ -127,6 +127,22 @@ briefly and checks the IDs again before killing; if they changed it thaws and
 refuses. Never fabricate consent, use a blanket force flag, or keep polling a
 running job without the user's choice to wait.
 
+`restart-dikarya-worker` also stops `dikarya-worker-voucher` (it is
+`PartOf=dikarya-worker.service`), so when that unit is running its
+`voucher_sync` scans/applies are in the same report (each job carries a
+`queue` field) and the same `INTERRUPT` line. A killed scan loses only its
+preview; an apply re-validates every target, so re-running it is safe. The
+voucher unit needs the same graceful drop-in, or the wrapper exits 78:
+
+```sh
+install -d -o root -g root -m 0755 /etc/systemd/system/dikarya-worker-voucher.service.d
+install -o root -g root -m 0644 /var/www/dikarya/scripts/dikarya-worker-graceful.conf /etc/systemd/system/dikarya-worker-voucher.service.d/zz-graceful.conf
+install -o root -g root -m 0755 /var/www/dikarya/scripts/restart-dikarya-worker /usr/local/sbin/restart-dikarya-worker
+install -o root -g root -m 0755 /var/www/dikarya/scripts/restart-dikarya-worker /usr/local/libexec/dikarya-worker-restart
+systemctl daemon-reload
+systemctl show dikarya-worker-voucher.service -p KillMode -p TimeoutStopUSec   # mixed, infinity
+```
+
 Exit 0: restart requested, verify ActiveState/MainPID and worker log.
 Exit 75: human decision required or approved job set changed.
 Exit 78: safety check/configuration failed, no restart authorized.

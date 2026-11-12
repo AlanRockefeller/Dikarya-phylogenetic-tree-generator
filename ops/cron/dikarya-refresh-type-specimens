@@ -20,8 +20,13 @@
 #              and records the types curators flagged there; paced 30 s apart
 #              because MycoMap.org rate-limits the endpoint (~75 minutes)
 # Exits 1 if a pass failed; the previous data stays in place.
+#
+# DIKARYA_ENV_FILE points at ~/.dikarya/redis.env (REDIS_URL with the Redis
+# password, written by ops/deploy/2026-11-11-redis-auth-nginx-buffers.sh), so
+# the curation pass honours the MycoMap.org rate-limit pause the live site
+# records in Redis. A missing file is ignored and the pause check fails open.
 
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-40 4 * * 1 mkdir -p $HOME/.dikarya/type-specimens && cd /var/www/dikarya && /var/www/dikarya/.venv/bin/python /var/www/dikarya/scripts/dikarya_refresh_type_specimens.py --since-days 8 > $HOME/.dikarya/type-specimens/$(date -u +\%Y-\%m-\%d).txt 2>&1; find $HOME/.dikarya/type-specimens -name '*.txt' -mtime +90 -delete
+40 4 * * 1 mkdir -p $HOME/.dikarya/type-specimens && cd /var/www/dikarya && DIKARYA_ENV_FILE=$HOME/.dikarya/redis.env /var/www/dikarya/.venv/bin/python /var/www/dikarya/scripts/dikarya_refresh_type_specimens.py --since-days 8 > $HOME/.dikarya/type-specimens/$(date -u +\%Y-\%m-\%d).txt 2>&1; find $HOME/.dikarya/type-specimens -name '*.txt' -mtime +90 -delete

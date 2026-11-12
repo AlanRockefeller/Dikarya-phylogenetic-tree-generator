@@ -465,8 +465,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         if (claudeReviewSubtitle) {
             const when = payload?.generated_at ? new Date(payload.generated_at * 1000).toLocaleString() : '';
+            // Alan 11/11/26 - Only offer Re-run where the button exists; view-only pages have none.
+            const rerunHint = btnClaudeReviewRefresh ? ' — use Re-run for a fresh one.' : '.';
             claudeReviewSubtitle.textContent = payload?.cached
-                ? `Saved review${when ? ` from ${when}` : ''} — use Re-run for a fresh one.`
+                ? `Saved review${when ? ` from ${when}` : ''}${rerunHint}`
                 : `Reviewed by ${payload?.model || 'Claude'}${when ? ` at ${when}` : ''}.`;
         }
 
@@ -2589,6 +2591,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showStatus('No species epithet to qualify with cf. — annotated with the plain name.', 'info', 5000);
             }
         }
+        // Alan 11/11/26 - Only a selection that is one clade saves without asking. One that
+        // splits into several groups is usually a stray selected tip elsewhere in the tree
+        // (job cewq: three adjacent tips plus one 16 rows down, scrolled out of view), so leave
+        // the editor open, showing the group count, for the user to save or cancel.
+        const groupCount = annotationEditorState.memberGroups?.length || 1;
+        if (groupCount > 1) {
+            showStatus(
+                `The ${memberIds.length} selected sequences form ${groupCount} separate groups, not one clade. `
+                + 'Check the selection, then Save or Cancel.',
+                'warning', 7000
+            );
+            return;
+        }
         const pending = memberIds.slice();
         quickAnnotationsInFlight.push(pending);
         Promise.resolve(submitAnnotationEditor({ quick: true })).finally(() => {
@@ -2800,19 +2815,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     // (closest_type_service.py); this only shows the answer. A sequence counter drops a reply
     // that arrives after a newer load, so a slow request cannot overwrite a fresher one.
     let closestTypeRequest = 0;
-    async function refreshClosestTypeNotice() {
+    // Alan 11/11/26 - Set once GET /tree/state has answered, i.e. tree_state.json now exists on disk.
+    let treeStateLoadedOnce = false;
+    // Alan 11/11/26 - Fetch separately from applying, so loadTreeNow() can start the request
+    // with the Newick and show the callout in the same paint as the tree; arriving later, the
+    // callout (which sits above the tree) pushed the whole tree down after it had drawn.
+    async function fetchClosestType() {
+        try {
+            const resp = await fetch(`/api/job/${JOB_ID}/closest-type`, { cache: 'no-store' });
+            if (resp.ok) return (await resp.json()).closest || null;
+        } catch (err) {}
+        return null;
+    }
+    async function refreshClosestTypeNotice(prefetched = null) {
         const row = getEl('notice-closest-type');
         const text = getEl('notice-closest-type-text');
         const detail = getEl('notice-closest-type-detail');
         if (!row || !text || !detail) return;
         const requestId = ++closestTypeRequest;
-        let closest = null;
-        try {
-            const resp = await fetch(`/api/job/${JOB_ID}/closest-type`, { cache: 'no-store' });
-            if (resp.ok) closest = (await resp.json()).closest || null;
-        } catch (err) {
-            closest = null;
-        }
+        // Alan 11/11/26 - Use the request loadTreeNow() already started when it passes one.
+        const closest = await (prefetched || fetchClosestType());
         if (requestId !== closestTypeRequest) return;
         if (!closest) {
             row.classList.add('hidden');
@@ -3130,6 +3152,22 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!viewer) initViewer();
             if (!viewer) return;
 
+            // Alan 11/11/26 - Fetch tree state alongside the Newick, so saved renames are applied
+            // right after the redraw instead of after a further round trip; otherwise every
+            // reload briefly showed renamed tips under their original names and then flipped back.
+            // Alan 11/11/26 - On the first load the state may not exist yet: GET /tree/state then midpoint-roots
+            // and writes tree_pruned.newick, and the Newick download (initialize_tree) would race
+            // that write. So the first load waits for the state; later loads run in parallel.
+            const isFirstTreeLoad = !treeStateLoadedOnce;
+            const treeStatePromise = TreeEditActions.getTreeState(JOB_ID);
+            // Alan 11/11/26 - Mark a failed prefetch handled; it is still awaited (and reported) below.
+            treeStatePromise.catch(() => {});
+            if (isFirstTreeLoad) {
+                try { await treeStatePromise; } catch (firstStateErr) {}
+            }
+            // Alan 11/11/26 - Start the closest-type request now too (it never rejects). It reads
+            // the tree state, so on a first load it starts only once the state exists.
+            const closestTypePromise = fetchClosestType();
             const resp = await fetch(`/api/job/${JOB_ID}/download/tree/newick`, { cache: "no-store" });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const newick = await resp.text();
@@ -3139,13 +3177,35 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!trimmed) throw new Error("Empty tree data received.");
             if (trimmed.startsWith("<")) throw new Error("Invalid tree format: Server returned HTML.");
 
+            // Alan 11/11/26 - Wait for the tree state BEFORE drawing, so the render, the saved
+            // renames and the display prefs below all land in one task and paint once. Drawing
+            // first and awaiting the state after it showed original names for a frame.
+            let prefetchedTreeState = null;
+            let prefetchedTreeStateError = null;
+            try {
+                prefetchedTreeState = await treeStatePromise;
+            } catch (stateErr) {
+                prefetchedTreeStateError = stateErr;
+            }
+            // Alan 11/11/26 - On the first load, give the closest-type callout a short head start
+            // so it lands in the same paint as the tree (arriving later it pushed the tree down).
+            // Later reloads (each prune, rename, reroot) do not wait: the callout is already in
+            // place, and holding every edit's redraw for it cost up to 0.8 s each time.
+            if (isFirstTreeLoad) {
+                await Promise.race([closestTypePromise, new Promise(resolve => setTimeout(resolve, 800))]);
+            }
+
             // Alan 9/24/26 - Pass the chosen sort into the render so a prune, rename or rooting
             // change draws once, keeps the camera, and the Sort button's label stays true.
             await viewer.render(newick, { sortMode: treeSortMode });
 
             // Fetch tree state to get midpoint rooting status and restore selection sets
             try {
-                const loadedTreeState = await TreeEditActions.getTreeState(JOB_ID);
+                // Alan 11/11/26 - Use the state fetched in parallel with the Newick above.
+                if (prefetchedTreeStateError) throw prefetchedTreeStateError;
+                const loadedTreeState = prefetchedTreeState;
+                // Alan 11/11/26 - Later loads may now fetch state and Newick in parallel.
+                treeStateLoadedOnce = true;
                 // Alan 5/29/26 - Cache the latest tree state for alignment-viewer launches and other UI reads.
                 treeState = loadedTreeState;
                 // Alan 8/15/26 - Reevaluate Edited FASTA from the authoritative persisted state
@@ -3202,7 +3262,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (!autoRootNamed) setRootingNotice('');
                 // Alan 11/2/26 - Refresh the closest-type callout; a prune, recompute or new
                 // sequence of interest can change the answer. Not awaited: it is advisory.
-                refreshClosestTypeNotice();
+                // Alan 11/11/26 - Apply the answer requested alongside the Newick.
+                refreshClosestTypeNotice(closestTypePromise);
                 // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
                 if (loadedTreeState.renames && viewer && typeof viewer.applyRenames === 'function') {
                     viewer.applyRenames(loadedTreeState.renames);
@@ -3235,10 +3296,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/24/26 - viewer.render() replaced every node object, so any collapse the
             // viewer was holding an undo entry for no longer exists; the persisted checkpoint,
             // which is a file snapshot, does survive and is re-read here.
-            await refreshServerUndoState();
-
             // Restore display preferences (font sizes, spacing) from localStorage
+            // Alan 11/11/26 - Before the undo-state round trip, not after it: waiting on the
+            // network here let the default-sized tree paint and then redraw at the saved size.
             restoreDisplayPrefs();
+            // Alan 11/11/26 - Draw pending annotations and settle the fitted width now, in the
+            // same task as the render, instead of on timers after the first paint (each timer
+            // step used to shift every tip label right again).
+            if (viewer && typeof viewer.settleLayoutNow === 'function') viewer.settleLayoutNow();
+
+            await refreshServerUndoState();
 
             // Post-render sync
             updateSupportUI(viewer.getStats());
@@ -4391,7 +4458,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const actionName = recordCount === 1 ? 'Refreshing Mycomap record' : `Refreshing ${recordCount} Mycomap records`;
                 runBackendAction(actionName, async () => {
                     const result = await TreeEditActions.refreshMycomapRecords(JOB_ID, tipNames);
-                    const refreshedCount = Number(result.refreshed_count) || recordCount;
+                    // Alan 11/11/26 - Trust a reported 0; `|| recordCount` claimed records a 429 never reached.
+                    const refreshedCount = Number.isFinite(Number(result.refreshed_count)) && result.refreshed_count !== null && result.refreshed_count !== undefined
+                        ? Number(result.refreshed_count)
+                        : recordCount;
                     const updatedCount = Number(result.updated_tip_count) || 0;
                     const warningCount = Array.isArray(result.warnings) ? result.warnings.length : 0;
                     const refreshedText = `${refreshedCount} Mycomap record${refreshedCount === 1 ? '' : 's'} refreshed.`;

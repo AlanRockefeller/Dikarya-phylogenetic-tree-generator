@@ -6,8 +6,10 @@
 # (photo download + QR/OCR decode) and would hold a tree worker that long.
 #
 # PartOf=dikarya-worker.service, so restart-dikarya-worker restarts it too and
-# it never keeps running stale code after a deploy. That restart does NOT check
-# this queue, so check it by hand first:
+# it never keeps running stale code after a deploy. The guarded wrapper reports
+# this queue's running scans and asks before killing them, and requires
+# dikarya-worker-graceful.conf on this unit (see scripts/WORKER_RESTART.md).
+# With an older installed wrapper, check by hand first:
 #   redis-cli LLEN rq:queue:voucher_sync ; redis-cli ZCARD rq:wip:voucher_sync
 # A killed scan only loses its preview (nothing is written to iNaturalist until
 # an apply run); an apply re-validates every target before writing, so
@@ -19,12 +21,15 @@
 #   cp scripts/dikarya-worker-hardening.conf /etc/systemd/system/dikarya-worker-voucher.service.d/hardening.conf
 #   cp scripts/dikarya-umask.conf            /etc/systemd/system/dikarya-worker-voucher.service.d/umask.conf
 #   cp scripts/dikarya-worker-voucher-memory.conf /etc/systemd/system/dikarya-worker-voucher.service.d/zz-memory.conf
+#   cp scripts/dikarya-worker-graceful.conf  /etc/systemd/system/dikarya-worker-voucher.service.d/zz-graceful.conf
 #   systemctl daemon-reload && systemctl enable --now dikarya-worker-voucher
 #   grep "Worker serving queue" /var/www/dikarya/var/logs/worker-voucher.log
 #
-# The graceful-shutdown drop-in is deliberately NOT installed here: it sets
-# TimeoutStopSec=infinity, which would make every restart-dikarya-worker wait
-# up to 3h for a scan to finish.
+# The graceful-shutdown drop-in is required: the guarded restart-dikarya-worker
+# refuses (exit 78) while this unit runs without it. It sets
+# TimeoutStopSec=infinity, so a restart drains a running scan (up to its 3h RQ
+# timeout) instead of killing it; the wrapper reports that scan first and only
+# an explicit INTERRUPT approval cuts it short.
 #
 # To back out: systemctl disable --now dikarya-worker-voucher, then remove the
 # unit and its .d directory. Queued runs stay in Redis until a worker returns.

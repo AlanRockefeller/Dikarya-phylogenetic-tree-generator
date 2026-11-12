@@ -240,6 +240,29 @@ def default_file_mode() -> int:
     return _DEFAULT_FILE_MODE
 
 
+def write_json_atomic(path: PathLike, data, **dump_kwargs) -> None:
+    """Replace a plain JSON file atomically, keeping its mode.
+
+    mkstemp creates 0600, so the target's existing mode is preserved, or
+    default_file_mode() used for a new file (see that function).
+    """
+    import json
+    import tempfile
+
+    path = Path(path)
+    dump_kwargs.setdefault("separators", (",", ":"))
+    mode = (path.stat().st_mode & 0o777) if path.exists() else default_file_mode()
+    fd, temp_path = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle, **dump_kwargs)
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 def discard_artifact(path: PathLike) -> int:
     """
     Delete an artifact in whichever form it exists. Returns bytes reclaimed.

@@ -28,13 +28,20 @@ def _isolate_ncbi_pacing():
     mycomap_org_service.CURATION_PAUSE_KEY = f"dikarya:test:mycomap-org:curation-paused:{run_id}"
     curation_key_refused = mycomap_org_service.CURATION_KEY_REFUSED_KEY
     mycomap_org_service.CURATION_KEY_REFUSED_KEY = f"dikarya:test:mycomap-org:curation-key-refused:{run_id}"
+    curation_exempt_state = mycomap_org_service.CURATION_EXEMPT_STATE_KEY
+    mycomap_org_service.CURATION_EXEMPT_STATE_KEY = f"dikarya:test:mycomap-org:curation-exempt-state:{run_id}"
+    # Nor pause the live tree viewer's MycoMap record refreshes.
+    refresh_pause_prefix = mycomap_org_service.REFRESH_PAUSE_KEY_PREFIX
+    mycomap_org_service.REFRESH_PAUSE_KEY_PREFIX = f"dikarya:test:mycomap-org:refresh-paused:{run_id}:"
     try:
         yield
     finally:
+        mycomap_org_service.REFRESH_PAUSE_KEY_PREFIX = refresh_pause_prefix
         ncbi_pacing.KEY_PREFIX = original
         mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = auth_prefix
         mycomap_org_service.CURATION_PAUSE_KEY = curation_pause_key
         mycomap_org_service.CURATION_KEY_REFUSED_KEY = curation_key_refused
+        mycomap_org_service.CURATION_EXEMPT_STATE_KEY = curation_exempt_state
 
 
 @pytest.fixture(autouse=True, scope="session")

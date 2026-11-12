@@ -527,6 +527,12 @@ class Config:
     CLAUDE_REVIEW_MAX_CONCURRENT = int(os.environ.get('CLAUDE_REVIEW_MAX_CONCURRENT', '2'))
     # Site-wide billed-review allowance per UTC day. Cache hits do not consume it.
     CLAUDE_REVIEW_MAX_DAILY = int(os.environ.get('CLAUDE_REVIEW_MAX_DAILY', '25'))
+    # Forced re-runs (refresh=true) skip the cache, so each requester and each
+    # job get their own small share of the daily allowance above.
+    CLAUDE_REVIEW_MAX_REFRESHES_PER_REQUESTER = int(
+        os.environ.get('CLAUDE_REVIEW_MAX_REFRESHES_PER_REQUESTER', '5'))
+    CLAUDE_REVIEW_MAX_REFRESHES_PER_JOB = int(
+        os.environ.get('CLAUDE_REVIEW_MAX_REFRESHES_PER_JOB', '3'))
     WORKER_DIR = Path(os.environ.get('WORKER_DIR') or BASE_DIR / 'var' / 'workers')
     WORKER_EXPECTED_COUNTS = {
         "phylo_high": nonnegative_int_env("EXPECTED_PHYLO_HIGH_WORKERS", 2),

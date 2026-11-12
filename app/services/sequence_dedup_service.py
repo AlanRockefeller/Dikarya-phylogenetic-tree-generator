@@ -112,7 +112,8 @@ def record_provenance(header: str, metadata: Optional[Dict[str, Any]] = None) ->
         if value in _OBSERVATION_SOURCES:
             return "observation"
 
-    first = str(header or "").lstrip(">").strip().split(None, 1)
+    # A MAFFT-reversed record ("_R_MO123456.1") is still that accession.
+    first = re.sub(r"^_R_", "", str(header or "").lstrip(">").strip()).split(None, 1)
     if first and _VERSIONED_COMPACT_MO_RE.match(first[0]):
         return "genbank"
 
@@ -259,7 +260,8 @@ def record_accession(header: str, metadata: Optional[Dict[str, Any]] = None) -> 
         if usable(text):
             return text.upper()
 
-    first = str(header or "").lstrip(">").strip().split(None, 1)
+    # A MAFFT-reversed record ("_R_MO123456.1") is still that accession.
+    first = re.sub(r"^_R_", "", str(header or "").lstrip(">").strip()).split(None, 1)
     if first and usable(first[0]):
         return first[0].upper()
     return ""

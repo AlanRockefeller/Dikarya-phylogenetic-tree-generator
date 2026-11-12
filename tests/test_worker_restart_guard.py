@@ -18,14 +18,14 @@ def load_guard():
 
 def test_busy_agent_gets_report_without_restart():
     guard = load_guard()
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", return_value=json.dumps({"jobs": [{"id": "job-a"}]})), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", io.StringIO("")), patch("select.select", return_value=([], [], [])):
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", return_value=json.dumps({"jobs": [{"id": "job-a"}]})), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", io.StringIO("")), patch("select.select", return_value=([], [], [])):
         assert guard.main() == 75
         mutate.assert_not_called()
 
 
 def test_unsafe_shutdown_config_refuses_even_idle_restart():
     guard = load_guard()
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "control-group", "90s"]), patch.object(guard.subprocess, "run") as mutate:
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "inactive", "control-group", "90s"]), patch.object(guard.subprocess, "run") as mutate:
         assert guard.main() == 78
         mutate.assert_not_called()
 
@@ -43,7 +43,7 @@ def test_changed_job_set_cancels_approved_interrupt_and_thaws():
     guard = load_guard()
     reports = [json.dumps({"jobs": [{"id": name}]}) for name in ("job-a", "job-b")]
     stream = io.StringIO("INTERRUPT job-a\n")
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 75
         assert [call.args[0][1] for call in mutate.call_args_list] == ["freeze", "thaw"]
 
@@ -52,8 +52,8 @@ def test_high_queue_covers_second_worker_when_installed():
     guard = load_guard()
     reports = [json.dumps({"jobs": [{"id": "job-a"}, {"id": "job-b"}]})] * 2
     stream = io.StringIO("INTERRUPT job-a,job-b\n")
-    # ActiveState of dikarya-worker-high2, then KillMode/TimeoutStopUSec per unit.
-    inspect = ["active", "mixed", "infinity", "mixed", "infinity"]
+    # ActiveState of dikarya-worker-high2 and -voucher, then KillMode/TimeoutStopUSec per unit.
+    inspect = ["active", "inactive", "mixed", "infinity", "mixed", "infinity"]
     with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports) as report, patch.object(guard.subprocess, "run", return_value=guard.subprocess.CompletedProcess([], 0)) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 0
         assert report.call_args.args[0][-1] == "phylo_high"
@@ -89,7 +89,7 @@ def test_partial_kill_names_units_and_skips_restart(capsys):
         failed = args[1] == "kill" and args[-1] == units[1]
         return guard.subprocess.CompletedProcess(args, 1 if failed else 0)
 
-    inspect = ["active", "mixed", "infinity", "mixed", "infinity"]
+    inspect = ["active", "inactive", "mixed", "infinity", "mixed", "infinity"]
     with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run", side_effect=systemctl) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 70
     verbs = [call.args[0][1] for call in mutate.call_args_list]
@@ -106,7 +106,7 @@ def test_failed_thaw_is_reported_and_blocks_restart(capsys):
     def systemctl(args, check):
         return guard.subprocess.CompletedProcess(args, 1 if args[1] == "thaw" else 0)
 
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run", side_effect=systemctl) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run", side_effect=systemctl) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 70
     assert [call.args[0][1] for call in mutate.call_args_list] == ["freeze", "kill", "thaw"]
     assert json.dumps({"thaw_failed": ["dikarya-worker.service"]}) in capsys.readouterr().out
@@ -114,7 +114,7 @@ def test_failed_thaw_is_reported_and_blocks_restart(capsys):
 
 def test_second_worker_without_graceful_config_refuses_restart():
     guard = load_guard()
-    inspect = ["active", "mixed", "infinity", "control-group", "90s"]
+    inspect = ["active", "inactive", "mixed", "infinity", "control-group", "90s"]
     with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch.object(guard.subprocess, "run") as mutate:
         assert guard.main() == 78
         mutate.assert_not_called()
@@ -253,3 +253,46 @@ def test_graceful_restart_is_bulk_only_and_accepts_no_arguments(graceful_guard):
     guard.sys.argv.append("--force")
     assert guard.main(bulk=True, after_current=True) == 64
     execute.assert_not_called()
+
+
+def test_crash_looping_voucher_unit_does_not_block_restart(capsys):
+    guard = load_guard()
+    # high2 inactive; voucher activating in auto-restart; then both units' shutdown config.
+    inspect = ["inactive", "activating", "auto-restart", "mixed", "infinity", "mixed", "infinity"]
+    reports = [json.dumps({"queue": "phylo_high", "pending": 0, "jobs": []}),
+               json.dumps({"queue": "voucher_sync", "pending": 0, "jobs": []})]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports) as report, patch.object(guard.subprocess, "run") as mutate:
+        assert guard.main() == 0
+        # Its queue is still reported, and it is restarted by name.
+        assert [call.args[0][-1] for call in report.call_args_list] == ["phylo_high", "voucher_sync"]
+        mutate.assert_called_once_with(["/usr/bin/systemctl", "restart", "--no-block", "dikarya-worker.service", "dikarya-worker-voucher.service"], check=True)
+    assert "crash-looping" in capsys.readouterr().out
+
+
+def test_activating_voucher_unit_that_is_not_crash_looping_still_refuses():
+    guard = load_guard()
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "activating", "start"]), patch.object(guard.subprocess, "run") as mutate:
+        assert guard.main() == 78
+        mutate.assert_not_called()
+
+
+def test_crash_looping_unit_without_graceful_dropin_refuses():
+    guard = load_guard()
+    inspect = ["inactive", "activating", "auto-restart", "mixed", "infinity", "control-group", "90s"]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch.object(guard.subprocess, "run") as mutate:
+        assert guard.main() == 78
+        mutate.assert_not_called()
+
+
+def test_running_voucher_apply_is_never_offered_for_interrupt(capsys):
+    guard = load_guard()
+    inspect = ["inactive", "active", "mixed", "infinity", "mixed", "infinity"]
+    reports = [json.dumps({"queue": "phylo_high", "pending": 0, "jobs": []}),
+               json.dumps({"queue": "voucher_sync", "pending": 0,
+                           "jobs": [{"id": "42", "description": "voucher sync apply", "interruptible": False}]})]
+    stream = io.StringIO("INTERRUPT 42\n")
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+        assert guard.main() == 75
+        mutate.assert_not_called()
+    out = capsys.readouterr().out
+    assert "cannot be interrupted" in out and "INTERRUPT 42" not in out

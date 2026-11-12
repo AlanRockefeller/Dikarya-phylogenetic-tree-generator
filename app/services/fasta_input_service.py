@@ -28,10 +28,16 @@ def record_fasta_rejection(text, analysis, *, source, filename=None):
             folder.mkdir(mode=0o770, parents=True, exist_ok=True)
             info = folder.stat()
             if info.st_uid == os.geteuid():
+                # Separate tries: a refused chown (process without the shared
+                # group) must not also skip the g+rwx, as it did for the API
+                # archive on 2026-11-08 (see api_diagnostics._archive_directory).
                 try:
                     group = ARCHIVE_DIR.parent.stat().st_gid
                     if info.st_gid != group:
                         os.chown(folder, -1, group)
+                except OSError:
+                    pass
+                try:
                     folder.chmod(stat.S_IMODE(info.st_mode) | stat.S_ISGID | stat.S_IRWXG)
                 except OSError:
                     # RestrictSUIDSGID can refuse setgid even though the folder

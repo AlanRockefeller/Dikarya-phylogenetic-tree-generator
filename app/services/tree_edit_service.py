@@ -21,6 +21,7 @@ from app.services.artifact_storage import (
     discard_gzipped_form,
     gz_path,
     open_artifact,
+    write_json_atomic,
 )
 from app.services.raxml_validator import stored_bootstrap_cutoff
 from app.services.security_utils import coerce_bool
@@ -1000,24 +1001,88 @@ def rename_tips(tree_json: Dict, pairs) -> Dict:
     return tree_json
 
 
-def _replace_tip_label_fragment(label: str, old_value: str,
-                                new_value: str) -> Tuple[str, bool]:
-    """Replace one name/location fragment while tolerating whitespace changes."""
-    old_value = " ".join(str(old_value or "").split())
-    new_value = " ".join(str(new_value or "").split())
-    if not old_value or old_value.casefold() == new_value.casefold():
+def _metadata_for_tip(sequence_metadata, original_name: str) -> Optional[Dict]:
+    """The one input_info.json sequence_metadata row for a tip, or None.
+
+    Same matching as the MycoMap source link (MAFFT ``_R_`` prefix and
+    whitespace tolerated, unique match required), minus its first-token
+    fallback: this result is written back, so a near miss must not be.
+    """
+    from app.services.mycomap_sequence_link_service import find_sequence_metadata_row
+    return find_sequence_metadata_row(sequence_metadata, original_name,
+                                      allow_token_match=False)
+
+
+def _phrase_pattern(value: str) -> str:
+    return (r"(?<!\w)" + r"\s+".join(re.escape(part) for part in value.split())
+            + r"(?!\w)")
+
+
+def _replace_old_name(label: str, candidates: List[str],
+                      new_value: str) -> Tuple[str, bool]:
+    """Replace the first old value found in ``label`` with ``new_value``.
+
+    Longest candidate first, whole words only, and never a match that lies
+    inside an occurrence of the new value itself: with candidates "Amanita"
+    and "Amanita sp.", "Amanita sp. X" must become "Amanita muscaria X", and
+    "Amanita muscaria X" must be left alone rather than become "Amanita
+    muscaria muscaria X".
+    """
+    protected = [m.span() for m in re.finditer(_phrase_pattern(new_value), label,
+                                                flags=re.IGNORECASE)]
+    old_spans = [m.span() for old_value in candidates
+                 for m in re.finditer(_phrase_pattern(old_value), label, flags=re.IGNORECASE)]
+    # The label already shows the new name on its own (not merely as part of a
+    # longer old name such as "X y var. z"): it is current, and any old name
+    # beside it is the user's own note -- "X y (was X z)" must stay as written.
+    if any(not any(o_start <= p_start and p_end <= o_end for o_start, o_end in old_spans)
+           for p_start, p_end in protected):
         return label, False
-    pattern = r"\s+".join(re.escape(part) for part in old_value.split())
-    updated, count = re.subn(pattern, lambda _match: new_value, label, count=1, flags=re.IGNORECASE)
-    if not count:
-        return label, False
-    return " ".join(updated.split()).strip(), True
+    for old_value in sorted(candidates, key=len, reverse=True):
+        for match in re.finditer(_phrase_pattern(old_value), label, flags=re.IGNORECASE):
+            start, end = match.span()
+            if any(p_start <= start and end <= p_end for p_start, p_end in protected):
+                continue
+            updated = label[:start] + new_value + label[end:]
+            return " ".join(updated.split()).strip(), True
+    return label, False
+
+
+def tip_observation_reference(original_name: str, current_label: str = "",
+                              metadata: Optional[Dict] = None) -> Optional[str]:
+    """The observation a tip names, or None.
+
+    ``MO123456`` is both a Mushroom Observer label and a GenBank accession, so
+    the compact form is honoured only when the record's provenance is not
+    GenBank (record_provenance: an NCBI/GenBank source, or a version suffix
+    such as ``MO123456.1``). Explicit forms (``mo:123456``, iNat ids) always
+    count. Unknown provenance keeps the compact form: that is how a label typed
+    or pasted into the Tree Builder names a Mushroom Observer record.
+    """
+    from app.services.mycomap_service import extract_mycomap_observation_reference
+    from app.services.sequence_dedup_service import record_provenance
+
+    allow_compact = record_provenance(original_name, metadata) != "genbank"
+    for value in (original_name, current_label):
+        reference = extract_mycomap_observation_reference(
+            str(value or ""), allow_compact_mo=allow_compact)
+        if reference:
+            return reference
+    return None
 
 
 def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
-                                refresh_result: Dict) -> Dict:
-    """Persist MycoMap name/location changes for selected observation-backed tips."""
-    from app.services.mycomap_service import extract_mycomap_observation_reference
+                                refresh_result: Dict,
+                                sequence_metadata: Optional[List[Dict]] = None) -> Dict:
+    """Persist MycoMap name/location changes for selected observation-backed tips.
+
+    Alan 11/11/26 - Only the old value inside the label is swapped, so a
+    hand-edited label keeps the rest of the user's text. The old name is
+    MycoMap's name before this refresh, or -- when MycoMap already held the new
+    name (an earlier refresh, or MycoMap.org's own button) -- the name the job
+    was built with, from sequence_metadata. A label that already shows the new
+    value is up to date; one that holds neither is left alone and reported.
+    """
 
     selected = []
     seen = set()
@@ -1044,20 +1109,30 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
     collect_original_names(tree_json.get("tree_structure") or {})
     before_records = refresh_result.get("before") or {}
     after_records = refresh_result.get("after") or {}
+    not_refreshed = set(refresh_result.get("not_refreshed") or [])
     renames = tree_json.get("renames") or {}
     changes = []
     warnings = []
+    # Tips whose label now shows MycoMap's name (changed here or already did).
+    # Only these may have their stored taxon moved on: for any other tip the
+    # old taxon is the only record of what to replace on a later refresh.
+    settled = []
+    settled_refs = {}
 
     for original_name in selected:
         if original_name not in original_tip_names:
             warnings.append(f"Tree tip is no longer available: {original_name[:120]}")
             continue
         current_label = str(renames.get(original_name) or original_name)
-        reference = (
-            extract_mycomap_observation_reference(original_name)
-            or extract_mycomap_observation_reference(current_label)
-        )
+        metadata = _metadata_for_tip(sequence_metadata, original_name) or {}
+        reference = tip_observation_reference(original_name, current_label, metadata)
         if not reference:
+            continue
+        settled_refs[original_name] = reference
+        if reference in not_refreshed:
+            # Already named in the refresh warnings. MycoMap's stored record
+            # may still come back in "after", but it was not refreshed, so it
+            # must not rewrite the label (or, later, the stored taxon).
             continue
         before = before_records.get(reference) or {}
         after = after_records.get(reference) or {}
@@ -1068,21 +1143,36 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
         updated_label = current_label
         changed_fields = []
         for field in ("scientific_name", "location"):
-            old_value = str(before.get(field) or "").strip()
-            new_value = str(after.get(field) or "").strip()
-            if old_value.casefold() == new_value.casefold():
+            new_value = " ".join(str(after.get(field) or "").split())
+            if not new_value:
                 continue
-            updated_label, replaced = _replace_tip_label_fragment(
-                updated_label,
-                old_value,
-                new_value,
-            )
+            candidates = [str(before.get(field) or "").strip()]
+            if field == "scientific_name":
+                # taxon_before_refresh survives an earlier refresh that moved
+                # taxon on, so a label restored to the old name stays fixable.
+                candidates.append(str(metadata.get("taxon") or "").strip())
+                candidates.append(str(metadata.get("taxon_before_refresh") or "").strip())
+            candidates = [" ".join(old.split()) for old in dict.fromkeys(candidates)
+                          if old and " ".join(old.split()).casefold() != new_value.casefold()]
+            if not candidates:
+                if field == "scientific_name":
+                    settled.append(original_name)
+                continue
+            updated_label, replaced = _replace_old_name(updated_label, candidates, new_value)
             if replaced:
                 changed_fields.append(field)
-            elif old_value:
+                if field == "scientific_name":
+                    settled.append(original_name)
+            elif re.search(_phrase_pattern(new_value), updated_label, flags=re.IGNORECASE):
+                # Already showing the refreshed value (e.g. a hand edit).
+                if field == "scientific_name":
+                    settled.append(original_name)
+                continue
+            elif field == "scientific_name":
                 warnings.append(
-                    f"Refreshed {reference}, but its old {field.replace('_', ' ')} "
-                    "was not present in the tree label."
+                    f"MycoMap now names {reference} {new_value}, but this tip's label "
+                    f"does not contain its old name ({candidates[0]}), so the label "
+                    "was left as it is."
                 )
 
         if updated_label != current_label:
@@ -1098,7 +1188,78 @@ def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
         "tree_state": tree_json,
         "changes": changes,
         "warnings": warnings,
+        "settled_tips": list(dict.fromkeys(settled)),
+        # The observation each settled tip was resolved to here, which may
+        # have come from its saved label rather than its original name;
+        # refresh_sequence_metadata_names() must use the same one.
+        "settled_references": {name: settled_refs[name] for name in settled},
     }
+
+
+def read_input_info(job_dir: Path) -> Optional[Dict]:
+    """input_info.json as a dict, or None when it is missing or unreadable."""
+    try:
+        with open_artifact(Path(job_dir) / "input_info.json", "rt") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return stored if isinstance(stored, dict) else None
+
+
+def refresh_sequence_metadata_names(job_dir: Path, input_info: Optional[Dict],
+                                    tip_names: List[str],
+                                    refresh_result: Dict,
+                                    references: Optional[Dict[str, str]] = None) -> List[Dict]:
+    """Record refreshed MycoMap names in input_info.json's sequence_metadata.
+
+    Alan 11/11/26 - Only ``taxon`` changes; the name the job was built with is
+    kept as ``taxon_before_refresh``. The tip's original name, which keys every
+    entry in tree_state and is what the Newick/FASTA/alignment files carry, is
+    deliberately left alone. ``tip_names`` must be the ``settled_tips`` of
+    refresh_mycomap_tip_labels(), and ``input_info`` the dict read_input_info()
+    returned under the same tree_state_lock, and ``references`` its
+    ``settled_references`` (a reference read from a saved label cannot be
+    re-derived from the original name alone). Returns the changes.
+
+    The pipeline worker rewrites input_info.json from its in-memory params
+    without this lock, so the caller must not call this while the job is
+    queued or running (that write would erase this one, or this one its). The
+    MycoMap NCBI reconcile, which runs on finished jobs, does take the lock.
+    """
+
+    if not isinstance(input_info, dict):
+        return []
+    metadata = input_info.get("sequence_metadata")
+    if not isinstance(metadata, list):
+        return []
+    after_records = refresh_result.get("after") or {}
+    not_refreshed = set(refresh_result.get("not_refreshed") or [])
+    changes = []
+    for original_name in dict.fromkeys(str(n or "").strip() for n in tip_names):
+        entry = _metadata_for_tip(metadata, original_name)
+        reference = ((references or {}).get(original_name)
+                     or tip_observation_reference(original_name, "", entry))
+        if reference in not_refreshed:
+            continue
+        after = after_records.get(reference) or {} if reference else {}
+        new_name = " ".join(str(after.get("scientific_name") or "").split())
+        if not entry or not after.get("found") or not new_name:
+            continue
+        old_name = str(entry.get("taxon") or "").strip()
+        if old_name.casefold() == new_name.casefold():
+            continue
+        entry.setdefault("taxon_before_refresh", old_name)
+        entry["taxon"] = new_name
+        entry["taxon_refreshed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        changes.append({"reference": reference, "old_taxon": old_name, "new_taxon": new_name})
+    if not changes:
+        return []
+    write_json_atomic(Path(job_dir) / "input_info.json", input_info)
+    for change in changes:
+        logger.info("event=mycomap.refresh_metadata_updated reference=%s old=%r new=%r",
+                    change["reference"], change["old_taxon"], change["new_taxon"])
+    return changes
+
 
 def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
     """

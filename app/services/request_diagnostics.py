@@ -205,6 +205,16 @@ def _actor_key():
     return actor_key(request.remote_addr if has_request_context() else None)
 
 
+def _is_loopback_request():
+    """True when the client address is loopback (127.0.0.0/8 or ::1)."""
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(str(request.remote_addr or "").strip()).is_loopback
+    except ValueError:
+        return False
+
+
 def _honeytoken(status):
     """The honeytoken this request tripped, or None.
 
@@ -480,8 +490,12 @@ def install_request_diagnostics(app):
 
         # Score the actor whatever the status was: enumeration shows up as
         # 404s, denied edits as 403s, and route breadth mostly as 200s.
+        # Loopback is never scored. Behind ProxyFix only a request that did
+        # not come through nginx has a loopback address -- the restart
+        # wrapper's /health check, an operator's curl -- and those escalated
+        # 127.0.0.0/24 on 2026-11-08. The failure records above still apply.
         try:
-            signals = _collect_signals(
+            signals = [] if _is_loopback_request() else _collect_signals(
                 app, status, bucket, reason,
                 request.url_rule.rule if request.url_rule is not None else None,
                 state["browser"].seen(actor),

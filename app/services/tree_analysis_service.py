@@ -4175,6 +4175,86 @@ def _reserve_daily_review() -> None:
         ) from exc
 
 
+def _give_back(client, taken: list) -> None:
+    """Decrement each reserved key once, dropping it from ``taken`` as it goes.
+
+    A key leaves the list only after its DECR succeeded, so a rollback that
+    fails partway and is retried never decrements the same key twice.
+    """
+    while taken:
+        client.decr(taken[-1])
+        taken.pop()
+
+
+def reserve_review_refresh(requester: str, job_id: str):
+    """Spend one forced re-run from this requester's and this job's daily cap.
+
+    A refresh bypasses the cache and so draws on the site-wide daily allowance.
+    Edit access alone does not bound that: anyone has edit access to an
+    ownerless job, and job ids are guessable. So each requester (a user id, or
+    an anonymous client's /24 or /64) and each job get their own small daily
+    budget, CLAUDE_REVIEW_MAX_REFRESHES_PER_REQUESTER and
+    CLAUDE_REVIEW_MAX_REFRESHES_PER_JOB. Fail-closed like the daily guard.
+
+    Returns a ``refund()`` callable. Call it when the review then fails before
+    a model call could have been billed (already running, daily limit, no
+    capacity, nothing to review), so a double click or a busy moment does not
+    use up a job's re-runs for the day.
+    """
+    now = time.time()
+    day_start = int(now // 86400) * 86400
+    retry_after = max(1, day_start + 86400 - int(now))
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    limits = (
+        (f"dikarya:claude_review:refresh:requester:{day}:{requester}",
+         max(1, int(getattr(Config, "CLAUDE_REVIEW_MAX_REFRESHES_PER_REQUESTER", 5))),
+         "You have re-run Claude reviews as often as allowed today."),
+        (f"dikarya:claude_review:refresh:job:{day}:{job_id}",
+         max(1, int(getattr(Config, "CLAUDE_REVIEW_MAX_REFRESHES_PER_JOB", 3))),
+         "This tree's Claude review has been re-run as often as allowed today."),
+    )
+    client = None
+    taken = []
+    try:
+        from app.workers.queue import get_redis_connection
+
+        client = get_redis_connection()
+        try:
+            for key, limit, message in limits:
+                current = int(client.incr(key))
+                taken.append(key)
+                if current == 1:
+                    client.expire(key, retry_after + 300)
+                if current > limit:
+                    raise TreeAnalysisRateLimited(
+                        message + " New re-runs reset at 00:00 UTC; the saved review "
+                        "is still available.", retry_after)
+        except TreeAnalysisRateLimited:
+            _give_back(client, taken)
+            raise
+
+        def refund() -> None:
+            try:
+                _give_back(client, taken)
+            except Exception as exc:  # best effort; the budget resets daily
+                logger.warning("Claude review refresh refund failed: %s", exc)
+        return refund
+    except TreeAnalysisRateLimited:
+        raise
+    except Exception as exc:
+        logger.warning("Claude review refresh guard unavailable: %s", exc)
+        # Give back what is still counted (e.g. INCR worked, EXPIRE did not,
+        # or the rate-limit rollback above failed partway): no review ran.
+        # Best effort; the original error is reported.
+        try:
+            _give_back(client, taken)
+        except Exception:
+            pass
+        raise TreeAnalysisUnavailable(
+            "Re-running the Claude review is temporarily unavailable."
+        ) from exc
+
+
 def _append_usage_log(job_dir: Path, payload: Dict[str, Any]) -> None:
     """Record one billed review so the monitoring page can total them.
 
