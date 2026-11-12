@@ -739,3 +739,35 @@ def test_versioned_or_genbank_compact_mo_is_not_an_observation():
     # Explicit and trusted forms still count.
     assert tip_observation_reference("MO123456 Amanita muscaria") == "mo:123456"
     assert tip_observation_reference("mo:123456 Amanita", "", {"source": "genbank"}) == "mo:123456"
+
+
+def test_mafft_reversed_tips_still_name_their_observation():
+    from app.services.mycomap_service import (
+        extract_mycomap_observation_reference,
+        extract_mycomap_observation_references,
+    )
+    from app.services.sequence_dedup_service import record_accession, record_provenance
+    from app.services.tree_edit_service import tip_observation_reference
+
+    reversed_tip = "_R_" + _ORIGINAL_TIP
+    assert extract_mycomap_observation_reference(reversed_tip) == "inat:154644100"
+    assert extract_mycomap_observation_references(reversed_tip) == ["inat:154644100"]
+    assert tip_observation_reference(reversed_tip) == "inat:154644100"
+    # Only MAFFT's leading marker is stripped, not "_R_" glued on mid-label.
+    assert extract_mycomap_observation_reference("note_R_iNat154644100") is None
+    # A reversed GenBank record keeps its provenance and accession.
+    assert record_provenance("_R_MO123456.1 Amanita") == "genbank"
+    assert record_accession("_R_MO123456.1 Amanita", {}) == "MO123456.1"
+    assert tip_observation_reference("_R_MO123456.1 Amanita") is None
+
+
+def test_tip_refresh_updates_a_mafft_reversed_tip():
+    from app.services.tree_edit_service import refresh_mycomap_tip_labels
+
+    reversed_tip = "_R_" + _ORIGINAL_TIP
+    state = {"tree_structure": {"children": [{"name": reversed_tip}, {"name": "other"}]},
+             "renames": {}}
+    result = refresh_mycomap_tip_labels(
+        state, [reversed_tip], _refresh_fixture("Podaxis inyoensis", "Podaxis pistillaris"))
+    assert result["changes"][0]["new_name"] == (
+        "_R_iNat154644100 Podaxis pistillaris Death Valley California US RiC 62")

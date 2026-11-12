@@ -10983,7 +10983,8 @@
 
   // Alan 7/16/26 - Resolve refreshable iNaturalist and Mushroom Observer references from tree tip labels.
   function extractObservationRecordReference(value) {
-    const normalized = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : getRecordLabelText(value);
+    // Alan 11/12/26 - Strip MAFFT's _R_ from a plain string too, as getRecordLabelText does for a node.
+    const normalized = typeof value === "string" ? value.replace(/^_R_/, "").replace(/\s+/g, " ").trim() : getRecordLabelText(value);
     if (!normalized) return null;
 
     const iNaturalistId = extractINaturalistObservationNumber(normalized);

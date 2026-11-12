@@ -176,6 +176,10 @@ _MO_EXPLICIT_PATTERNS = (
     r"\bmo\s+(\d{5,12})(?:[_-]\d+)?\b",
 )
 
+def _strip_mafft_reverse_prefix(text: str) -> str:
+    return re.sub(r"^(\s*)_R_", r"\1", text)
+
+
 # The ambiguous one: letters immediately followed by digits, no separator.
 _MO_COMPACT_PATTERN = r"\bmo(\d{5,12})(?:[_-]\d+)?\b"
 
@@ -198,7 +202,10 @@ def extract_mycomap_observation_references(
     ``extract_mycomap_observation_reference(x)``. Asserted in
     tests/test_observation_provenance.py.
     """
-    text = html.unescape(str(value or ""))
+    # MAFFT marks a record it reverse-complemented by prefixing "_R_" to its
+    # name, which glues "_R_" onto the label's first word ("_R_iNat154644100")
+    # so no \b-anchored pattern matches it. The viewer strips it the same way.
+    text = _strip_mafft_reverse_prefix(html.unescape(str(value or "")))
     if not text:
         return []
 
@@ -237,7 +244,10 @@ def extract_mycomap_observation_reference(
     The default stays True so display and lookup callers -- which only ever use
     the answer to label or fetch something -- keep behaving as they did.
     """
-    text = html.unescape(str(value or ""))
+    # MAFFT marks a record it reverse-complemented by prefixing "_R_" to its
+    # name, which glues "_R_" onto the label's first word ("_R_iNat154644100")
+    # so no \b-anchored pattern matches it. The viewer strips it the same way.
+    text = _strip_mafft_reverse_prefix(html.unescape(str(value or "")))
     if not text:
         return None
 
@@ -3903,6 +3913,20 @@ def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
                 label_identifier = inat_token
             elif label_identifier.casefold() != inat_token.casefold():
                 label_identifier = f"{label_identifier} {inat_token}"
+        elif (mo_reference := extract_mycomap_observation_reference(
+                current_name, allow_compact_mo=False)) and mo_reference.startswith('mo:'):
+            # Alan 11/12/26 - The rebuilt label kept an iNat token but dropped
+            # MycoMap.org's "MO #336310", so a Mushroom Observer sequence lost
+            # the one thing a reader could look up and the observation dedup
+            # could no longer pair it with the GenBank copy of the same
+            # collection (MycoMap#9406 vs OM658334.1, job 6b5x). The compact
+            # "MO336310" is not honoured here: it is shape-identical to an
+            # accession.
+            mo_token = f"MO #{mo_reference.split(':', 1)[1]}"
+            if curator:
+                label_identifier = mo_token
+            elif mo_token.casefold() not in label_identifier.casefold():
+                label_identifier = f"{label_identifier} {mo_token}"
         elif not re.search(r'\d', label_identifier):
             # A curator-written header such as "Hygrocybe cf minutula QC (type
             # NY) KM248898" leads with the genus and puts the accession last;
