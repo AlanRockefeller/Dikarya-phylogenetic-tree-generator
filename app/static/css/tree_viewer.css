@@ -708,10 +708,20 @@ body.tree-expanded #btn-fullscreen i::before {
         border-left: 0;
     }
 
-    /* The page-level actions (Alignment Viewer, Annotations, Export, Analyze) follow the
+    /* The page-level actions (Alignment Viewer, Annotations, Export) follow the
        desktop controls: the mobile sheet reaches them by id, and "Show all advanced
-       controls" brings them back. An id selector so Tailwind's .flex cannot win. */
+       controls" brings them back. Analyze is the page's primary action, so it alone
+       stays in the header on a phone instead of being buried at the bottom of More.
+       Id selectors so Tailwind's .flex cannot win. */
     #tree-title-actions {
+        display: none;
+    }
+
+    #tree-title-actions:has(#btn-claude-review) {
+        display: flex;
+    }
+
+    body:not(.mobile-show-desktop-controls) #tree-title-actions > :not(#btn-claude-review) {
         display: none;
     }
 
