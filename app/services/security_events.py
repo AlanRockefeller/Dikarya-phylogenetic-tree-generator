@@ -464,7 +464,13 @@ def classify_request_failure(
         # Eight of these in a week were the only "injection probes" there were,
         # and one pushed a plain crawler (35.192.47.0/24) over the escalation
         # threshold.
-        if _is_scraped_template(raw, query):
+        #
+        # A malformed job id elsewhere in the path is still reported: only an
+        # id slot that is itself the scraped template (/job/${url}) is excused.
+        id_malformed = job_id_valid is False and not (
+            job_id is not None and _SCRAPED_TEMPLATE_SEGMENT_RE.match(str(job_id))
+        )
+        if not id_malformed and _is_scraped_template(raw, query):
             return BUCKET_SCANNER, "scraped_placeholder"
         return BUCKET_TARGETED, "injection_probe"
 

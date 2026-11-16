@@ -314,6 +314,22 @@ class ScannerClassificationTests(unittest.TestCase):
             ),
             (BUCKET_TARGETED, "job_id_malformed"),
         )
+        # Nor does a scraped template outside the id slot.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/AAAA'/${url}", status=404, matched_route=None,
+                job_id_valid=False, job_id="AAAA'",
+            ),
+            (BUCKET_TARGETED, "injection_probe"),
+        )
+        # The template in the id slot itself is the crawler, not a probe.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/${url}", status=404, matched_route=None,
+                job_id_valid=False, job_id="${url}",
+            ),
+            (BUCKET_SCANNER, "scraped_placeholder"),
+        )
         # A placeholder outside the id slot does not excuse a malformed id.
         self.assertEqual(
             classify_request_failure(
