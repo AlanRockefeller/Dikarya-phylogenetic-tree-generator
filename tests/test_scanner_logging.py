@@ -266,6 +266,9 @@ class ScannerClassificationTests(unittest.TestCase):
             ("/${jndi:ldap://x/a}", ""),
             ("/${escapeHtml(url)}", "q=<script>alert(1)</script>"),
             ("/${escapeHtml(url)}/{{7*7}}", ""),
+            # request.path arrives with %3F decoded; what follows it still counts.
+            ("/${url}/?<script>alert(1)</script>", ""),
+            ("/$%7Burl%7D/%3F%3Cscript%3Ealert(1)%3C/script%3E", ""),
         ):
             self.assertEqual(
                 classify_request_failure(

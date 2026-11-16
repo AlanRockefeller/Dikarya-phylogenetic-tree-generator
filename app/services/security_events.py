@@ -253,8 +253,14 @@ SCANNER_REASONS = (
 
 
 def _path_segments(raw_path):
-    """The percent-decoded segments of a path, query excluded."""
-    path = str(raw_path or "").split("?", 1)[0]
+    """The percent-decoded segments of the whole path.
+
+    Not split at "?": Flask's request.path has already decoded %3F, so a
+    split would drop whatever came after an encoded question mark (a
+    <script> marker, say) from the residual-probe check. The real query
+    string reaches the callers separately.
+    """
+    path = str(raw_path or "")
     try:
         path = unquote(path)
     except (UnicodeDecodeError, ValueError):
