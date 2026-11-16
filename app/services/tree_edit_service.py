@@ -2755,8 +2755,8 @@ def _recompute_tree_staged(
         def skip_step(step, label):
             update_step_meta(rq_job, step, {"state": STATE_SKIPPED, "label": label})
 
-        def overview(message):
-            publish_overview(event_job_id, message)
+        def overview(message, icon=STATE_RUNNING):
+            publish_overview(event_job_id, message, icon=icon)
     else:
         def start_step(step, label, detail="", tool=""):
             return None
@@ -2767,7 +2767,7 @@ def _recompute_tree_staged(
         def skip_step(step, label):
             return None
 
-        def overview(message):
+        def overview(message, icon=None):
             return None
     
     # 1. Load state. This snapshot only decides what goes INTO the recompute
@@ -2797,8 +2797,9 @@ def _recompute_tree_staged(
     else:
         extract_pruned_fasta(input_raw, tree_json, alignment_pruned_path)
         input_detail = f"{_count_fasta_records(alignment_pruned_path)} selected sequence(s)"
-    finish_step("input", input_detail)
-    overview(f"Recompute input ready: {input_detail}")
+    # One feed line per step: finish_step() already draws the completed line,
+    # so a matching overview() only repeated it under a "still running" icon.
+    finish_step("input", f"Recompute input ready: {input_detail}")
     skip_step("orient", "Orientation Check (skipped)")
     skip_step("blast", "BLAST Search (skipped)")
     skip_step("its", "ITS Region Extraction (skipped)")
@@ -2829,8 +2830,7 @@ def _recompute_tree_staged(
         orient_unclassified_headers=orient_unclassified,
     )
     align_detail = f"{_count_fasta_records(alignment_pruned_aligned_path)} sequence(s) aligned"
-    finish_step("align", align_detail)
-    overview(align_detail)
+    finish_step("align", f"Alignment complete: {align_detail}")
     
     # 4. Re-trim
     trim_params = job_params.trimming_params or TrimmingParams(method="none")
@@ -2851,7 +2851,8 @@ def _recompute_tree_staged(
             trim_terminal_overhangs=False,
         )
         skip_step("trim", trim_label)
-        overview("Trimming skipped (method: none)")
+        # skip_step() only records meta, so this is the step's one live line.
+        overview("Trimming skipped (method: none)", icon="skipped")  # STATE_SKIPPED; not imported when events are off
     else:
         start_step("trim", trim_label, "", tool=trim_tool)
         trim_stats = run_trimming(
@@ -2865,8 +2866,7 @@ def _recompute_tree_staged(
         )
         retained_columns = _count_fasta_columns(alignment_pruned_trimmed_path)
         trim_detail = format_trimming_detail(trim_method, trim_stats, retained_columns)
-        finish_step("trim", trim_detail)
-        overview(trim_detail)
+        finish_step("trim", f"Trimming complete: {trim_detail}")
     
     # 5. Re-build Tree
     tree_params = job_params.tree_builder_params or TreeBuilderParams(method="nj")
@@ -2890,8 +2890,12 @@ def _recompute_tree_staged(
     # metadata so Generation Details never combines new final dimensions with
     # the old terminal-crop counts.
     metadata["trimming_details"] = trim_stats
-    finish_step("tree", "Tree generated")
-    overview(f"Tree rebuilt using {tree_method.upper()}")
+    try:
+        from app.workers.tasks import _tree_method_display
+        method_label = _tree_method_display(tree_method)
+    except Exception:
+        method_label = str(tree_method or "").upper()
+    finish_step("tree", f"Tree rebuilt using {method_label}")
     
     # 6. Update State
     start_step("post", "Post-Processing", "Saving recomputed tree")
@@ -2929,8 +2933,8 @@ def _recompute_tree_staged(
     # click in the last seconds of the run conflict for no reason.
     _record_tree_state_snapshot(job_dir, rq_job, logger)
 
+    # The worker publishes the final "Recompute complete!" overview itself.
     finish_step("post", "All files ready")
-    overview("Recompute complete")
         
     return {
         "status": "completed",
