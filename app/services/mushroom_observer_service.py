@@ -1284,9 +1284,14 @@ def post_completed_tree_comment(job_id: str, metrics: Dict[str, Any]) -> Dict[st
             "summary": MO_COMMENT_SUMMARY,
             "content": content,
         })
-        result = (posted.get("results") or [{}])[0]
+        # MO answers a POST at its default detail level, where ``results`` is a
+        # list of bare ids ([212293]), not of objects. Calling .get() on that
+        # integer raised AttributeError after the comment had been posted, so
+        # the job reported a failed comment that was sitting on the observation.
+        result = (posted.get("results") or [None])[0]
+        comment_id = result.get("id") if isinstance(result, dict) else result
         output["status"] = "success"
-        output["mo_comment_id"] = result.get("id") or posted.get("id")
+        output["mo_comment_id"] = comment_id or posted.get("id")
         return output
     except MushroomObserverError as exc:
         output["status"] = "failed"
