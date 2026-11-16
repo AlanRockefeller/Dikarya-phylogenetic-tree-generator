@@ -1140,6 +1140,16 @@ A scanner word in the job-id slot (`/job/.env`) is filed as scanner, not as
 `job_id_malformed`: it is a sweep appending its dictionary to a directory it
 found on our pages, not a test of the id parser.
 
+So is a placeholder a crawler scraped from our own output, filed as scanner
+with `reason=scraped_placeholder`: `/${escapeHtml(url)}` is an href lifted out
+of the inline script on `/tree` by something that does not run JavaScript, and
+`/api/v1/jobs/$JOB_ID` is the API docs' curl example replayed verbatim. Until
+2026-11-16 the first was an `injection_probe` and the second a
+`job_id_malformed`, and one pushed an ordinary crawler over the escalation
+threshold. The template shape is identifier-only on purpose (`${name}`,
+`${a.b}`, `${fn(a.b)}`): `${7*7}` and `${jndi:...}` are still injection probes,
+as is anything else suspicious beside a scraped segment.
+
 **`app/services/security_honeytokens.py` plants paths that exist only in our
 own output.** A scanner's dictionary was fixed before it ever contacted this
 host, so it cannot ask for something it learned here. Three today: a

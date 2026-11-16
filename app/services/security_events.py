@@ -165,6 +165,24 @@ _INJECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A placeholder a crawler lifted out of our own pages and requested as a URL.
+# Two shapes, both seen 11/13-11/16/26 and both reported as attacks until then:
+#
+# - a JavaScript template literal scraped from an inline script, where
+#   `<a href="${escapeHtml(url)}">` reads as a relative link to anything that
+#   pattern-matches href="..." without running the script. Identifier-only on
+#   purpose: `${name}`, `${a.b}` or `${fn(a.b)}`. A template-injection probe
+#   needs an operator, a colon or a quote (`${7*7}`, `${jndi:ldap://...}`) and
+#   stays an injection_probe.
+# - a documentation placeholder in the job-id slot: `$JOB_ID` from the API
+#   docs' curl example, `{job_id}` from the OpenAPI path templates.
+_SCRAPED_TEMPLATE_SEGMENT_RE = re.compile(
+    r"^\$\{[A-Za-z_][\w.]*(?:\([A-Za-z_][\w.]*\))?\}$"
+)
+_DOC_PLACEHOLDER_SEGMENT_RE = re.compile(
+    r"^(?:\$[A-Za-z_]\w*|\{[A-Za-z_]\w*\}|<[A-Za-z_]\w*>|:[A-Za-z_]\w*)$"
+)
+
 # Dikarya's own surface. A miss under one of these is someone mapping this app
 # rather than sweeping the internet. The caller passes the live set of top-level
 # segments from the Flask URL map (see request_diagnostics), so a route added
@@ -228,7 +246,45 @@ SCANNER_REASONS = (
     "known_scanner_path",
     "unsupported_method",
     "unknown_route",
+    # A placeholder scraped from our own pages or API docs and requested as a
+    # literal URL -- see _SCRAPED_TEMPLATE_SEGMENT_RE.
+    "scraped_placeholder",
 )
+
+
+def _path_segments(raw_path):
+    """The percent-decoded segments of a path, query excluded."""
+    path = str(raw_path or "").split("?", 1)[0]
+    try:
+        path = unquote(path)
+    except (UnicodeDecodeError, ValueError):
+        pass
+    return [segment for segment in path.split("/") if segment]
+
+
+def _is_scraped_template(raw_path, query):
+    """Is the only injection-shaped thing here a template literal from our JS?
+
+    True when a path segment is an identifier-only `${...}` and, with those
+    segments taken out, neither the rest of the path nor the query still
+    matches the injection patterns. A probe hiding behind one such segment is
+    therefore still reported.
+    """
+    segments = _path_segments(raw_path)
+    kept = [s for s in segments if not _SCRAPED_TEMPLATE_SEGMENT_RE.match(s)]
+    if len(kept) == len(segments):
+        return False
+    rest = "/" + "/".join(kept) + ("?" + str(query) if query else "")
+    try:
+        rest = rest + "\n" + unquote(rest)
+    except (UnicodeDecodeError, ValueError):
+        pass
+    return not (_INJECTION_RE.search(rest) or _TOOL_ARGUMENT_RE.search(rest))
+
+
+def _has_doc_placeholder(raw_path):
+    """Does a path segment hold a documentation placeholder ($JOB_ID, {job_id})?"""
+    return any(_DOC_PLACEHOLDER_SEGMENT_RE.match(s) for s in _path_segments(raw_path))
 
 
 def _scanner_reason(path_lower, user_agent, status, method):
@@ -370,6 +426,13 @@ def classify_request_failure(
     if _NULL_BYTE_RE.search(probe_text):
         return BUCKET_TARGETED, "null_byte"
     if _INJECTION_RE.search(probe_text):
+        # Alan 11/16/26 - /${escapeHtml(url)} is a crawler following an href it
+        # scraped out of the inline script on /tree, not template injection.
+        # Eight of these in a week were the only "injection probes" there were,
+        # and one pushed a plain crawler (35.192.47.0/24) over the escalation
+        # threshold.
+        if _is_scraped_template(raw, query):
+            return BUCKET_SCANNER, "scraped_placeholder"
         return BUCKET_TARGETED, "injection_probe"
 
     # A job route reached with an id that validate_job_id() refuses is someone
@@ -381,6 +444,11 @@ def classify_request_failure(
     # is a .env sweep appending its dictionary to every directory it found on
     # our pages (four Google Cloud hosts, one tool, 11/4-11/7), not a test of
     # the id parser. It falls through to the scanner bucket below.
+    #
+    # Alan 11/16/26 - Nor is a documentation placeholder. /api/v1/jobs/$JOB_ID
+    # is a crawler replaying the curl example from the API docs.
+    if job_id_valid is False and _has_doc_placeholder(raw):
+        return BUCKET_SCANNER, "scraped_placeholder"
     if job_id_valid is False and not _is_scanner_vocabulary(lower):
         return BUCKET_TARGETED, "job_id_malformed"
 
