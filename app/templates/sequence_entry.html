@@ -2299,6 +2299,22 @@
         return error;
     }
 
+    // Alan 11/16/26 - What to show when a submission throws. A fetch that never
+    // got an HTTP answer rejects with a TypeError whose message is the
+    // browser's own ("Failed to fetch", "Load failed", "NetworkError when
+    // attempting to fetch resource."), which told one user nothing ten times
+    // in a week: each time the request body stalled until nginx gave up on it
+    // after 60 seconds, and "Submission Failed: Failed to fetch" does not say
+    // that pressing the button again is the fix.
+    function submissionFailureMessage(error) {
+        const networkLevel = error instanceof TypeError && !error.httpStatus;
+        if (!networkLevel) return error?.message || 'Unknown error';
+        return 'the connection stalled or dropped before Dikarya answered. '
+            + 'Nothing on this page was lost. If you are signed in, check My Jobs '
+            + 'first: the first attempt may already have created a job. Try again '
+            + 'only if it is not listed.';
+    }
+
     // Alan 10/7/26 - BLAST takes 35-95 s and the iNat tree preview can take a
     // minute. Held open as one request, a phone that switched apps while it
     // waited lost the answer ("Load failed", nginx 499) though the server
@@ -4306,7 +4322,7 @@
 
         } catch (e) {
             reportWorkflowFailure('tree_builder.mycomap_quick_tree', e);
-            showStatus('Submission failed: ' + e.message, 'error');
+            showStatus('Submission failed: ' + submissionFailureMessage(e), 'error');
             mycomapQuickTreeBtn.disabled = false;
             fetchMycomapBtn.disabled = false;
             mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
@@ -5767,7 +5783,7 @@
 
         } catch (e) {
             reportWorkflowFailure('tree_builder.submit_quick_tree', e);
-            showStatus('Submission Failed: ' + e.message, 'error');
+            showStatus('Submission Failed: ' + submissionFailureMessage(e), 'error');
             btn.disabled = false;
             btn.innerHTML = '▶ Build Quick Tree';
         }
@@ -6451,7 +6467,7 @@
 
         } catch (e) {
             reportWorkflowFailure('tree_builder.submit_job', e);
-            showStatus('Submission Failed: ' + e.message, 'error');
+            showStatus('Submission Failed: ' + submissionFailureMessage(e), 'error');
             btn.disabled = false;
             btn.innerHTML = '<i class="fas fa-play mr-2"></i> Start Analysis';
         }

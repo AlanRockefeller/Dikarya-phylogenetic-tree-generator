@@ -246,6 +246,99 @@ class ScannerClassificationTests(unittest.TestCase):
             (BUCKET_TARGETED, "job_id_malformed"),
         )
 
+    def test_a_scraped_placeholder_is_crawler_noise_not_an_attack(self):
+        # A crawler following href="${escapeHtml(url)}" out of an inline script.
+        for path in (
+            "/${escapeHtml(url)}",
+            "/$%7BescapeHtml(observation.url)%7D",
+            "/${observationHref}",
+            "/job/aq7c/${escapeHtml(sequence.mycomap_blast_url)}",
+        ):
+            self.assertEqual(
+                classify_request_failure(path=path, status=404, matched_route=None),
+                (BUCKET_SCANNER, "scraped_placeholder"),
+                path,
+            )
+        # Template injection needs more than an identifier, and stays reported,
+        # as does a probe riding along beside a scraped segment.
+        for path, query in (
+            ("/${7*7}", ""),
+            ("/${jndi:ldap://x/a}", ""),
+            ("/${escapeHtml(url)}", "q=<script>alert(1)</script>"),
+            ("/${escapeHtml(url)}/{{7*7}}", ""),
+            # request.path arrives with %3F decoded; what follows it still counts.
+            ("/${url}/?<script>alert(1)</script>", ""),
+            ("/$%7Burl%7D/%3F%3Cscript%3Ealert(1)%3C/script%3E", ""),
+        ):
+            self.assertEqual(
+                classify_request_failure(
+                    path=path, query=query, status=404, matched_route=None,
+                ),
+                (BUCKET_TARGETED, "injection_probe"),
+                path,
+            )
+        # The API docs' curl example and the OpenAPI path template.
+        for path, job_id in (
+            ("/api/v1/jobs/$JOB_ID", "$JOB_ID"),
+            ("/api/v1/jobs/{job_id}", "{job_id}"),
+            ("/api/v1/jobs/$JOB_ID/files/tree.newick", "$JOB_ID"),
+        ):
+            self.assertEqual(
+                classify_request_failure(
+                    path=path, status=401,
+                    matched_route="/api/v1/jobs/<job_id>", job_id_valid=False,
+                    job_id=job_id,
+                ),
+                (BUCKET_SCANNER, "scraped_placeholder"),
+                path,
+            )
+
+    def test_a_probe_beside_a_scraped_placeholder_stays_targeted(self):
+        # Artifact names and tool binaries are checked as well as injection, so
+        # the ${ falls back to being reported as the injection probe it was.
+        for path in (
+            "/${escapeHtml(url)}/input_info.json",
+            "/${url}/tree_state.json",
+            "/${escapeHtml(url)}/mafft",
+        ):
+            self.assertEqual(
+                classify_request_failure(path=path, status=404, matched_route=None),
+                (BUCKET_TARGETED, "injection_probe"),
+                path,
+            )
+        # A placeholder in the id slot with an argument smuggled in beside it.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/$JOB_ID/--exec", status=404, matched_route=None,
+                job_id_valid=False, job_id="$JOB_ID",
+            ),
+            (BUCKET_TARGETED, "job_id_malformed"),
+        )
+        # Nor does a scraped template outside the id slot.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/AAAA'/${url}", status=404, matched_route=None,
+                job_id_valid=False, job_id="AAAA'",
+            ),
+            (BUCKET_TARGETED, "injection_probe"),
+        )
+        # The template in the id slot itself is the crawler, not a probe.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/${url}", status=404, matched_route=None,
+                job_id_valid=False, job_id="${url}",
+            ),
+            (BUCKET_SCANNER, "scraped_placeholder"),
+        )
+        # A placeholder outside the id slot does not excuse a malformed id.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/AAAA'/$JOB_ID", status=404, matched_route=None,
+                job_id_valid=False, job_id="AAAA'",
+            ),
+            (BUCKET_TARGETED, "job_id_malformed"),
+        )
+
     def test_an_ordinary_user_error_is_neither(self):
         bucket, reason = classify_request_failure(
             path="/whats-new", method="GET", status=404, matched_route=None,

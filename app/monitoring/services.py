@@ -166,7 +166,19 @@ def emit_health_transitions(metrics):
         _transition("redis", False, "ping=ok")
         queue_was_bad = _HEALTH_STATES.get("queue_depth", False)
         detail = " ".join(f"{name}={depth}" for name, depth in depths.items())
-        _transition("queue_depth", queue_depth >= (10 if queue_was_bad else 25), f"queued={queue_depth} wip={wip} {detail}")
+        # Alan 11/16/26 - The bulk queue is judged on its own, much higher,
+        # threshold. A backlog there is what the queue is for: one user's
+        # 414-observation iNaturalist batch held this "unhealthy" for three
+        # hours, and jobs waiting on MycoMap re-entering the queue then flipped
+        # it recovered/unhealthy two minutes apart. 25 waiting on the
+        # interactive queues still means people are being kept waiting.
+        bulk_depth = depths.get(QUEUE_BULK, 0)
+        interactive_depth = queue_depth - bulk_depth
+        queue_bad = (
+            interactive_depth >= (10 if queue_was_bad else 25)
+            or bulk_depth >= (500 if queue_was_bad else 1000)
+        )
+        _transition("queue_depth", queue_bad, f"queued={queue_depth} wip={wip} {detail}")
     except Exception as exc:
         _transition("redis", True, f"exception={type(exc).__name__}")
 

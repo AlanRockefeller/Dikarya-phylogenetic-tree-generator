@@ -169,3 +169,41 @@ def test_existing_tree_rejects_bad_fasta_before_writing_and_archives_it(archive,
     assert response.status_code == 400
     assert (job_dir / "input_raw.fasta").read_text() == original
     assert snapshots(archive)[0]["sequence"] == raw
+
+
+def test_a_list_of_names_is_named_as_such_before_the_per_record_issues():
+    raw = (">ONT131-351 ric=1572\nChlorophyllum olivieri (Barla) Vellinga, 2002 CL/F22.160\n"
+           ">ONT131-376 ric=2640\nChlorophyllum brunneum (Farl. & Burt) Vellinga, 2002\n"
+           ">ONT132-392 ric2473\n")
+    result = analyze_dna_fasta(raw)
+    assert result["issues"][0]["code"] == "no_dna_sequences"
+    assert "list of names" in result["issues"][0]["message"]
+    # One record with real DNA beside the names is an ordinary broken file.
+    mixed = analyze_dna_fasta(raw + ">ok\nACGTACGTACGTACGT\n")
+    assert "no_dna_sequences" not in [issue["code"] for issue in mixed["issues"]]
+
+
+def test_a_sequence_pasted_on_its_header_line_is_explained():
+    raw = "> sample02 haplotype1 AAGTCGTAACAAGGTTTCCGTAGGTGAACC TGCGGAAGGATCATTATTGAATT"
+    issue = analyze_dna_fasta(raw)["issues"][0]
+    assert issue["code"] == "empty_sequence"
+    assert issue["sequence_on_header_line"] is True
+    assert "same line as its name" in issue["message"]
+    # An ordinary empty record keeps the ordinary message.
+    plain = analyze_dna_fasta(">sample02 haplotype1\n")["issues"][0]
+    assert "has no DNA sequence" in plain["message"]
+
+
+def test_dna_wrapped_into_short_rows_still_counts_as_dna():
+    # 16 bases over two short rows, then a stray name: record one has DNA.
+    raw = ">one\nACGTACGT\nACGTACGT\nsample_1\n>two\n"
+    codes = [issue["code"] for issue in analyze_dna_fasta(raw)["issues"]]
+    assert "no_dna_sequences" not in codes
+
+
+def test_dna_on_a_header_line_past_the_issue_cap_is_still_seen():
+    raw = "".join(f">empty{i}\n" for i in range(100))
+    raw += "> sample02 AAGTCGTAACAAGGTTTCCGTAGGTGAACC TGCGGAAGGATCATTATTGAATT\n"
+    result = analyze_dna_fasta(raw)
+    assert result["issue_count"] > 100
+    assert "no_dna_sequences" not in [issue["code"] for issue in result["issues"]]

@@ -1182,6 +1182,108 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertEqual(result["failed_observations"][0]["observation_id"], 102)
         self.assertIn("2 bulk tree jobs", result["message"])
 
+    def _run_batch_with_budget(self, budget_seconds, created):
+        collected = {
+            "observations": [{"id": 101}, {"id": 102}],
+            "skipped_existing_tree_count": 0,
+            "skipped_missing_mycomap_count": 0,
+        }
+
+        def create_one(raw_input, **_kwargs):
+            created.append(raw_input)
+            return {"job_id": f"job-{raw_input}"}
+
+        with (
+            patch.object(inaturalist_tree_service, "BATCH_QUEUE_TIME_BUDGET_SECONDS", budget_seconds),
+            patch.object(inaturalist_tree_service, "parse_inaturalist_tree_input", return_value={}),
+            patch.object(
+                inaturalist_tree_service,
+                "resolve_inaturalist_user_or_project",
+                return_value={
+                    "type": "project",
+                    "scope": {"type": "project", "value": "example"},
+                },
+            ),
+            patch.object(
+                inaturalist_tree_service,
+                "_collect_tree_eligible_observations",
+                return_value=collected,
+            ),
+            patch.object(
+                inaturalist_tree_service,
+                "create_job_from_inat_observation",
+                side_effect=create_one,
+            ),
+        ):
+            return inaturalist_tree_service.create_jobs_from_inat_scope(
+                "example",
+                resolved_type="project",
+            )
+
+    def test_batch_that_runs_out_of_time_before_queueing_anything_fails(self):
+        created = []
+        with self.assertRaises(inaturalist_tree_service.InatTreeError) as caught:
+            self._run_batch_with_budget(-1, created)
+        self.assertEqual(created, [])
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(caught.exception.details["not_queued_count"], 2)
+        self.assertIn("ran out of time", str(caught.exception))
+
+    def test_batch_that_runs_out_of_time_partway_returns_a_partial_result(self):
+        clock = [0.0]
+        created = []
+
+        def create_one(raw_input, **_kwargs):
+            created.append(raw_input)
+            clock[0] += 1.0  # each queued job spends a second
+            return {"job_id": f"job-{raw_input}"}
+
+        collected = {
+            "observations": [{"id": 101}, {"id": 102}, {"id": 103}],
+            "skipped_existing_tree_count": 0,
+            "skipped_missing_mycomap_count": 0,
+        }
+        with (
+            patch.object(inaturalist_tree_service, "BATCH_QUEUE_TIME_BUDGET_SECONDS", 0.5),
+            patch.object(inaturalist_tree_service.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(inaturalist_tree_service, "parse_inaturalist_tree_input", return_value={}),
+            patch.object(
+                inaturalist_tree_service,
+                "resolve_inaturalist_user_or_project",
+                return_value={
+                    "type": "project",
+                    "scope": {"type": "project", "value": "example"},
+                },
+            ),
+            patch.object(
+                inaturalist_tree_service,
+                "_collect_tree_eligible_observations",
+                return_value=collected,
+            ),
+            patch.object(
+                inaturalist_tree_service,
+                "create_job_from_inat_observation",
+                side_effect=create_one,
+            ),
+        ):
+            result = inaturalist_tree_service.create_jobs_from_inat_scope(
+                "example",
+                resolved_type="project",
+            )
+
+        self.assertEqual(created, ["101"])
+        self.assertEqual(result["queued_count"], 1)
+        self.assertEqual(result["not_queued_count"], 2)
+        self.assertTrue(result["partial"])
+        self.assertIn("2 more eligible observations were not queued", result["message"])
+
+    def test_batch_within_budget_queues_everything(self):
+        created = []
+        result = self._run_batch_with_budget(240, created)
+        self.assertEqual(result["queued_count"], 2)
+        self.assertEqual(result["not_queued_count"], 0)
+        self.assertFalse(result["partial"])
+
 
 if __name__ == "__main__":
     unittest.main()
