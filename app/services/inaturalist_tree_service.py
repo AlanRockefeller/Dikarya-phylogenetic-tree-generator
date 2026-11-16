@@ -1217,6 +1217,16 @@ def _collect_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]
 ANONYMOUS_BATCH_TREE_LIMIT = 100
 
 
+# Alan 11/16/26 - Queueing is synchronous and costs about 0.3 s an observation:
+# a signed-in 414-observation batch held a Gunicorn slot for 126 s. Nothing caps
+# a signed-in batch, so one a little over twice that size would have run into
+# nginx's proxy_read_timeout (300 s) and shown the user a 504 with an unknown
+# number of jobs already queued behind it. Past this budget the loop stops and
+# the answer says how many were left, which is still a deliberate non-cap: the
+# rest queue on the next run.
+BATCH_QUEUE_TIME_BUDGET_SECONDS = 240
+
+
 def anonymous_batch_limit_exceeded(user, eligible_count: int) -> bool:
     """True when an anonymous caller asks for more batch jobs than allowed."""
     signed_in = bool(user is not None and getattr(user, "is_authenticated", False))
@@ -3734,6 +3744,7 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
                                 mycomap_local_limit=None,
                                 mycomap_ncbi_limit=None) -> Dict[str, Any]:
     """Queue one one-click tree job for each eligible observation in a scope."""
+    deadline = time.monotonic() + BATCH_QUEUE_TIME_BUDGET_SECONDS
     parsed = parse_inaturalist_tree_input(raw_input)
     resolved = resolve_inaturalist_user_or_project(parsed, preferred_type=resolved_type)
     if resolved.get("type") == "ambiguous":
@@ -3763,8 +3774,17 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
     batch_id = uuid.uuid4().hex
     job_ids: List[str] = []
     failed_observations: List[Dict[str, Any]] = []
+    not_queued_count = 0
 
-    for observation in observations:
+    for index, observation in enumerate(observations):
+        if time.monotonic() >= deadline:
+            not_queued_count = eligible_count - index
+            logger.warning(
+                "event=inat_tree.batch_truncated Time budget spent after "
+                "%d of %d observations; %d left unqueued batch=%s",
+                index, eligible_count, not_queued_count, batch_id,
+            )
+            break
         obs_id = int(observation.get("id"))
         try:
             result = create_job_from_inat_observation(
@@ -3863,13 +3883,22 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
         )
         if queued_count:
             message += " The other queued jobs are unaffected."
+    if not_queued_count:
+        message += (
+            f" {not_queued_count} more eligible observation"
+            f"{'s were' if not_queued_count != 1 else ' was'} not queued, "
+            "because this batch is too large to queue in one request. Run it "
+            "again once these trees have finished; observations that already "
+            "have a tree are skipped."
+        )
 
     return {
         "status": "success",
-        "partial": bool(failed_count),
+        "partial": bool(failed_count or not_queued_count),
         "eligible_count": eligible_count,
         "queued_count": queued_count,
         "failed_count": failed_count,
+        "not_queued_count": not_queued_count,
         "failed_observations": failed_observations,
         "skipped_existing_tree_count": skipped_tree,
         "skipped_missing_mycomap_count": skipped_myco,
