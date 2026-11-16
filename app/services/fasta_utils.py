@@ -459,6 +459,30 @@ def _header_text_in_sequence_row(row: str, column: int) -> str:
     return tail if len(tail) <= 80 else tail[:79] + "\u2026"
 
 
+# Plain bases only. The IUPAC ambiguity codes are left out on purpose: most of
+# the alphabet is one (H, S, R, Y, M, K, D, B, V, W), so "Chlorophyllum" passes
+# a VALID_DNA_SYMBOLS test far too easily to tell a name from a sequence.
+_PLAIN_DNA_SYMBOLS = frozenset("ACGTUN-?")
+
+
+def _reads_as_dna(text: str) -> bool:
+    """Is this run of text DNA rather than a name? At least 10 symbols, 90% plain bases."""
+    bare = "".join(text.split())
+    if len(bare) < 10:
+        return False
+    return sum(1 for c in bare if c.upper() in _PLAIN_DNA_SYMBOLS) >= 0.9 * len(bare)
+
+
+def _dna_length_at_end_of_header(header: str) -> int:
+    """How many DNA symbols a header ends in, when the sequence was pasted on its line."""
+    length = 0
+    for token in reversed(header.split()):
+        if not _reads_as_dna(token):
+            break
+        length += len(token)
+    return length
+
+
 def analyze_dna_fasta(fasta_text: str) -> dict:
     """Inspect original text without dropping records, preambles or symbols.
 
@@ -514,12 +538,21 @@ def analyze_dna_fasta(fasta_text: str) -> dict:
         return {"valid": False, "record_count": len(records), "total_bases": total_bases,
                 "issues": issues, "issue_count": issue_count}
 
+    records_without_dna = 0
     for index, (record, (header, sequence)) in enumerate(zip(records, parsed), 1):
         details = {"record_number": index, "record_name": header, "line": record["line"]}
         if not header:
             issue("empty_header", f"FASTA record {index} on line {record['line']} has an "
                   "empty header. Add a name after '>', for example '>sample_1'.", **details)
-        if not sequence:
+        if not sequence and _dna_length_at_end_of_header(header) >= 30:
+            # A paste that lost its line breaks: '>name ACGT...' all on one line.
+            # Said outright, because "has no DNA sequence" reads as wrong to
+            # someone looking at a line that visibly ends in one.
+            issue("empty_sequence", f"FASTA record {index} on line {record['line']} has "
+                  "its DNA on the same line as its name, so the whole line was read as "
+                  "the name. Put '>' and the name on one line and the sequence on the "
+                  "line below it.", **details, sequence_on_header_line=True)
+        elif not sequence:
             issue("empty_sequence", f"FASTA record '{header[:100] or index}' on line "
                   f"{record['line']} has no DNA sequence. Add its nucleotide sequence "
                   "after the header; the record has not been removed.", **details)
@@ -540,9 +573,16 @@ def analyze_dna_fasta(fasta_text: str) -> dict:
                         first = {"line": line_number, "column": column,
                                  "sequence_position": position, "character": character,
                                  "character_code": f"U+{ord(character):04X}"}
+        if not sequence:
+            records_without_dna += 1
         if first:
             shown = ", ".join(repr(symbol) for symbol in sorted(invalid)[:10])
             header_text = _header_text_in_sequence_row(first_row, first["column"])
+            # Name-like text where the sequence belongs and no row of real DNA
+            # beside it. A short sequence with a typo ('AC!') is not this: its
+            # row does not read as a name.
+            if header_text and not any(_reads_as_dna(row) for _, row in record["rows"]):
+                records_without_dna += 1
             if header_text:
                 hint = (f"Line {first['line']} looks like part of a FASTA header, not "
                         f"DNA: '{header_text}'. A header must start with '>' on its own "
@@ -557,6 +597,24 @@ def analyze_dna_fasta(fasta_text: str) -> dict:
                   **{**details, **first}, invalid_symbols=sorted(invalid)[:20],
                   invalid_count=invalid_count,
                   **({"looks_like_header": True} if header_text else {}))
+
+    # A list of names and no sequences at all (a renaming table, a sample
+    # sheet). The per-record messages are each true but point at one symbol or
+    # one empty record at a time; one submitter edited the punctuation out of
+    # his species names six times over before giving up. Lead with what is
+    # actually missing -- the Tree Builder shows the first issue.
+    if len(records) >= 2 and issue_count and records_without_dna == len(records) \
+            and not any(item.get("sequence_on_header_line") for item in issues):
+        issue_count += 1
+        issues.insert(0, {
+            "code": "no_dna_sequences",
+            "message": (f"None of these {len(records)} records contains a DNA sequence; "
+                        "this looks like a list of names. Each record needs its "
+                        "nucleotide sequence (A, C, G, T) on the line after its '>' "
+                        "name line."),
+            "line": records[0]["line"], "column": 1,
+        })
+        del issues[100:]
 
     return {"valid": not issue_count, "record_count": len(records),
             "total_bases": total_bases, "issues": issues, "issue_count": issue_count}
