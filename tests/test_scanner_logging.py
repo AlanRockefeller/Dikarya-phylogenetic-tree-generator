@@ -275,15 +275,50 @@ class ScannerClassificationTests(unittest.TestCase):
                 path,
             )
         # The API docs' curl example and the OpenAPI path template.
-        for path in ("/api/v1/jobs/$JOB_ID", "/api/v1/jobs/{job_id}"):
+        for path, job_id in (
+            ("/api/v1/jobs/$JOB_ID", "$JOB_ID"),
+            ("/api/v1/jobs/{job_id}", "{job_id}"),
+            ("/api/v1/jobs/$JOB_ID/files/tree.newick", "$JOB_ID"),
+        ):
             self.assertEqual(
                 classify_request_failure(
                     path=path, status=401,
                     matched_route="/api/v1/jobs/<job_id>", job_id_valid=False,
+                    job_id=job_id,
                 ),
                 (BUCKET_SCANNER, "scraped_placeholder"),
                 path,
             )
+
+    def test_a_probe_beside_a_scraped_placeholder_stays_targeted(self):
+        # Artifact names and tool binaries are checked as well as injection, so
+        # the ${ falls back to being reported as the injection probe it was.
+        for path in (
+            "/${escapeHtml(url)}/input_info.json",
+            "/${url}/tree_state.json",
+            "/${escapeHtml(url)}/mafft",
+        ):
+            self.assertEqual(
+                classify_request_failure(path=path, status=404, matched_route=None),
+                (BUCKET_TARGETED, "injection_probe"),
+                path,
+            )
+        # A placeholder in the id slot with an argument smuggled in beside it.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/$JOB_ID/--exec", status=404, matched_route=None,
+                job_id_valid=False, job_id="$JOB_ID",
+            ),
+            (BUCKET_TARGETED, "job_id_malformed"),
+        )
+        # A placeholder outside the id slot does not excuse a malformed id.
+        self.assertEqual(
+            classify_request_failure(
+                path="/job/AAAA'/$JOB_ID", status=404, matched_route=None,
+                job_id_valid=False, job_id="AAAA'",
+            ),
+            (BUCKET_TARGETED, "job_id_malformed"),
+        )
 
     def test_an_ordinary_user_error_is_neither(self):
         bucket, reason = classify_request_failure(

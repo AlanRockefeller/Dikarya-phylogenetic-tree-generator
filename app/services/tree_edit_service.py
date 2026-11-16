@@ -2755,8 +2755,8 @@ def _recompute_tree_staged(
         def skip_step(step, label):
             update_step_meta(rq_job, step, {"state": STATE_SKIPPED, "label": label})
 
-        def overview(message, icon=STATE_RUNNING):
-            publish_overview(event_job_id, message, icon=icon)
+        def overview(message, icon=STATE_RUNNING, key=""):
+            publish_overview(event_job_id, message, icon=icon, key=key)
     else:
         def start_step(step, label, detail="", tool=""):
             return None
@@ -2767,7 +2767,7 @@ def _recompute_tree_staged(
         def skip_step(step, label):
             return None
 
-        def overview(message, icon=None):
+        def overview(message, icon=None, key=""):
             return None
     
     # 1. Load state. This snapshot only decides what goes INTO the recompute
@@ -2852,7 +2852,10 @@ def _recompute_tree_staged(
         )
         skip_step("trim", trim_label)
         # skip_step() only records meta, so this is the step's one live line.
-        overview("Trimming skipped (method: none)", icon="skipped")  # STATE_SKIPPED; not imported when events are off
+        # key matches job_status.js's skip:<step> line rebuilt from job.meta, so
+        # a reconnecting page shows this once. "skipped" is STATE_SKIPPED, which
+        # is not imported when events are off.
+        overview("Trimming skipped (method: none)", icon="skipped", key="skip:trim")
     else:
         start_step("trim", trim_label, "", tool=trim_tool)
         trim_stats = run_trimming(

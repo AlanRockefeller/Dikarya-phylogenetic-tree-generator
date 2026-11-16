@@ -84,3 +84,38 @@ class MushroomObserverMycoMapMessageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostCompletedTreeCommentIdTests(unittest.TestCase):
+    """MO's POST answer carries the new comment's id in three shapes."""
+
+    def _post(self, posted):
+        from flask import Flask
+        from app.services import mushroom_observer_service as mo
+
+        app = Flask(__name__)
+        app.config["MUSHROOM_OBSERVER_API_KEY"] = "test-key"
+
+        def fake_api(endpoint, method="GET", **_kwargs):
+            return posted if method == "POST" else {"results": []}
+
+        with app.app_context(), \
+                patch.object(mo, "_public_tree_url", return_value="https://dikarya.us/job/aq7c/view"), \
+                patch.object(mo, "_api_request", side_effect=fake_api):
+            return mo.post_completed_tree_comment("aq7c", {"mo_observation_id": 123})
+
+    def test_bare_id_in_results(self):
+        # The default detail level: results is a list of ids, not objects.
+        output = self._post({"results": [212293]})
+        self.assertEqual(output["status"], "success")
+        self.assertEqual(output["mo_comment_id"], 212293)
+
+    def test_object_in_results(self):
+        output = self._post({"results": [{"id": 212294}]})
+        self.assertEqual(output["status"], "success")
+        self.assertEqual(output["mo_comment_id"], 212294)
+
+    def test_top_level_id_fallback(self):
+        output = self._post({"id": 212295})
+        self.assertEqual(output["status"], "success")
+        self.assertEqual(output["mo_comment_id"], 212295)

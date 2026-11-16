@@ -192,6 +192,7 @@ def _classify(app, status):
         matched_route=request.url_rule.rule if request.url_rule is not None else None,
         user_agent=request.headers.get("User-Agent", "")[:200],
         job_id_valid=_job_id_validity(),
+        job_id=_job_id_from_request(),
         # Inspected for injection markers only. The query string holds user
         # input (sequence text, search terms) and is never written to a log.
         query=request.query_string.decode("latin-1", "replace")[:500],

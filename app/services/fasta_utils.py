@@ -539,12 +539,16 @@ def analyze_dna_fasta(fasta_text: str) -> dict:
                 "issues": issues, "issue_count": issue_count}
 
     records_without_dna = 0
+    # Kept apart from ``issues``, which stops growing at 100 entries: a record
+    # past the cap still counts as DNA on its header line.
+    dna_on_header_line = False
     for index, (record, (header, sequence)) in enumerate(zip(records, parsed), 1):
         details = {"record_number": index, "record_name": header, "line": record["line"]}
         if not header:
             issue("empty_header", f"FASTA record {index} on line {record['line']} has an "
                   "empty header. Add a name after '>', for example '>sample_1'.", **details)
         if not sequence and _dna_length_at_end_of_header(header) >= 30:
+            dna_on_header_line = True
             # A paste that lost its line breaks: '>name ACGT...' all on one line.
             # Said outright, because "has no DNA sequence" reads as wrong to
             # someone looking at a line that visibly ends in one.
@@ -578,11 +582,15 @@ def analyze_dna_fasta(fasta_text: str) -> dict:
         if first:
             shown = ", ".join(repr(symbol) for symbol in sorted(invalid)[:10])
             header_text = _header_text_in_sequence_row(first_row, first["column"])
-            # Name-like text where the sequence belongs and no row of real DNA
-            # beside it. A short sequence with a typo ('AC!') is not this: its
-            # row does not read as a name.
-            if header_text and not any(_reads_as_dna(row) for _, row in record["rows"]):
-                records_without_dna += 1
+            # Name-like text where the sequence belongs and no real DNA beside
+            # it. A short sequence with a typo ('AC!') is not this: its row does
+            # not read as a name. Judged on the record's other rows together, so
+            # DNA wrapped into short rows still counts as DNA.
+            if header_text:
+                other_rows = "".join(row for line_number, row in record["rows"]
+                                     if line_number != first["line"])
+                if not _reads_as_dna(other_rows):
+                    records_without_dna += 1
             if header_text:
                 hint = (f"Line {first['line']} looks like part of a FASTA header, not "
                         f"DNA: '{header_text}'. A header must start with '>' on its own "
@@ -604,7 +612,7 @@ def analyze_dna_fasta(fasta_text: str) -> dict:
     # his species names six times over before giving up. Lead with what is
     # actually missing -- the Tree Builder shows the first issue.
     if len(records) >= 2 and issue_count and records_without_dna == len(records) \
-            and not any(item.get("sequence_on_header_line") for item in issues):
+            and not dna_on_header_line:
         issue_count += 1
         issues.insert(0, {
             "code": "no_dna_sequences",

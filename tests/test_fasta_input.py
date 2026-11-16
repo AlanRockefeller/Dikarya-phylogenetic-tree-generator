@@ -192,3 +192,18 @@ def test_a_sequence_pasted_on_its_header_line_is_explained():
     # An ordinary empty record keeps the ordinary message.
     plain = analyze_dna_fasta(">sample02 haplotype1\n")["issues"][0]
     assert "has no DNA sequence" in plain["message"]
+
+
+def test_dna_wrapped_into_short_rows_still_counts_as_dna():
+    # 16 bases over two short rows, then a stray name: record one has DNA.
+    raw = ">one\nACGTACGT\nACGTACGT\nsample_1\n>two\n"
+    codes = [issue["code"] for issue in analyze_dna_fasta(raw)["issues"]]
+    assert "no_dna_sequences" not in codes
+
+
+def test_dna_on_a_header_line_past_the_issue_cap_is_still_seen():
+    raw = "".join(f">empty{i}\n" for i in range(100))
+    raw += "> sample02 AAGTCGTAACAAGGTTTCCGTAGGTGAACC TGCGGAAGGATCATTATTGAATT\n"
+    result = analyze_dna_fasta(raw)
+    assert result["issue_count"] > 100
+    assert "no_dna_sequences" not in [issue["code"] for issue in result["issues"]]

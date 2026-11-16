@@ -262,6 +262,30 @@ def _path_segments(raw_path):
     return [segment for segment in path.split("/") if segment]
 
 
+def _has_residual_probe(text):
+    """Does text still carry a targeted probe shape once placeholders are removed?
+
+    Every targeted indicator, not just injection: a scraped segment beside
+    ``input_info.json``, ``mafft`` or ``--exec`` is still someone probing us.
+    """
+    try:
+        text = text + "\n" + unquote(text)
+    except (UnicodeDecodeError, ValueError):
+        pass
+    return bool(
+        _INJECTION_RE.search(text)
+        or _TOOL_BINARY_RE.search(text)
+        or _ARTIFACT_PATH_RE.search(text)
+        or _TOOL_ARGUMENT_RE.search(text)
+    )
+
+
+def _path_without(raw_path, query, pattern):
+    """The path with every segment matching ``pattern`` removed, query re-attached."""
+    kept = [s for s in _path_segments(raw_path) if not pattern.match(s)]
+    return "/" + "/".join(kept) + ("?" + str(query) if query else "")
+
+
 def _is_scraped_template(raw_path, query):
     """Is the only injection-shaped thing here a template literal from our JS?
 
@@ -270,21 +294,21 @@ def _is_scraped_template(raw_path, query):
     matches the injection patterns. A probe hiding behind one such segment is
     therefore still reported.
     """
-    segments = _path_segments(raw_path)
-    kept = [s for s in segments if not _SCRAPED_TEMPLATE_SEGMENT_RE.match(s)]
-    if len(kept) == len(segments):
+    if not any(_SCRAPED_TEMPLATE_SEGMENT_RE.match(s) for s in _path_segments(raw_path)):
         return False
-    rest = "/" + "/".join(kept) + ("?" + str(query) if query else "")
-    try:
-        rest = rest + "\n" + unquote(rest)
-    except (UnicodeDecodeError, ValueError):
-        pass
-    return not (_INJECTION_RE.search(rest) or _TOOL_ARGUMENT_RE.search(rest))
+    return not _has_residual_probe(_path_without(raw_path, query, _SCRAPED_TEMPLATE_SEGMENT_RE))
 
 
-def _has_doc_placeholder(raw_path):
-    """Does a path segment hold a documentation placeholder ($JOB_ID, {job_id})?"""
-    return any(_DOC_PLACEHOLDER_SEGMENT_RE.match(s) for s in _path_segments(raw_path))
+def _is_doc_placeholder_job_id(job_id, raw_path, query):
+    """Is the job-id slot itself a documentation placeholder ($JOB_ID, {job_id})?
+
+    Only the extracted id counts: ``/job/AAAA'/$JOB_ID`` has a placeholder in
+    another segment and a malformed id in the slot, and stays job_id_malformed.
+    The rest of the path must also be free of any probe shape.
+    """
+    if not job_id or not _DOC_PLACEHOLDER_SEGMENT_RE.match(str(job_id)):
+        return False
+    return not _has_residual_probe(_path_without(raw_path, query, _DOC_PLACEHOLDER_SEGMENT_RE))
 
 
 def _scanner_reason(path_lower, user_agent, status, method):
@@ -385,7 +409,7 @@ def _is_app_surface(path_lower, app_segments):
 
 def classify_request_failure(
     *, path, method="GET", status=404, matched_route=None, user_agent="",
-    job_id_valid=None, query="", app_segments=None,
+    job_id_valid=None, query="", app_segments=None, job_id=None,
 ):
     """Return ``(bucket, reason)`` for a failed request.
 
@@ -397,6 +421,9 @@ def classify_request_failure(
     did). ``job_id_valid`` is the result of ``validate_job_id()`` when the route
     carries a job id, and ``None`` when the question does not apply -- passed in
     rather than imported so this module stays dependency-free.
+
+    ``job_id`` is the id extracted from the path when ``job_id_valid`` applies;
+    only that value is tested for a documentation placeholder.
 
     ``query`` is inspected for injection markers but is never returned and must
     never be logged: it carries user input. ``app_segments`` is the set of
@@ -447,7 +474,7 @@ def classify_request_failure(
     #
     # Alan 11/16/26 - Nor is a documentation placeholder. /api/v1/jobs/$JOB_ID
     # is a crawler replaying the curl example from the API docs.
-    if job_id_valid is False and _has_doc_placeholder(raw):
+    if job_id_valid is False and _is_doc_placeholder_job_id(job_id, raw, query):
         return BUCKET_SCANNER, "scraped_placeholder"
     if job_id_valid is False and not _is_scanner_vocabulary(lower):
         return BUCKET_TARGETED, "job_id_malformed"

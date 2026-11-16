@@ -2310,8 +2310,9 @@
         const networkLevel = error instanceof TypeError && !error.httpStatus;
         if (!networkLevel) return error?.message || 'Unknown error';
         return 'the connection stalled or dropped before Dikarya answered. '
-            + 'Nothing on this page was lost. Try again; if you are signed in, '
-            + 'My Jobs shows whether the first attempt went through.';
+            + 'Nothing on this page was lost. If you are signed in, check My Jobs '
+            + 'first: the first attempt may already have created a job. Try again '
+            + 'only if it is not listed.';
     }
 
     // Alan 10/7/26 - BLAST takes 35-95 s and the iNat tree preview can take a

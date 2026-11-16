@@ -3833,15 +3833,22 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
     auto_create_mycomap = int(
         collected.get("auto_create_mycomap_blast_count") or 0
     )
-    if eligible_count and queued_count == 0 and failed_count == eligible_count:
+    # Nothing queued is a failure whether every attempt failed or the time
+    # budget ran out (collecting the scope can spend it before the first try);
+    # a 202 here would show a success notice for a batch with no jobs.
+    if eligible_count and queued_count == 0 and (failed_count or not_queued_count):
         raise InatTreeError(
-            "No tree jobs could be queued. Please try again.",
+            "No tree jobs could be queued. Please try again."
+            if not not_queued_count else
+            "No tree jobs could be queued before this request ran out of time. "
+            "Please try again.",
             status=503,
             details={
                 "partial": False,
                 "eligible_count": eligible_count,
                 "queued_count": 0,
                 "failed_count": failed_count,
+                "not_queued_count": not_queued_count,
                 "failed_observations": failed_observations,
                 "skipped_existing_tree_count": skipped_tree,
                 "skipped_missing_mycomap_count": skipped_myco,
