@@ -1002,6 +1002,33 @@
                     <span id="notice-closest-type-detail" class="text-xs text-gray-600 dark:text-gray-300"></span>
                 </span>
             </div>
+            {# Filled by showMycomapRenameNotice() in tree_viewer_controller.js from the
+               refresh-mycomap-records answer's sequence_rename_warning, via textContent only:
+               sequences MycoMap.org refreshed but did not rename (API keys cannot rename). #}
+            <div id="notice-mycomap-rename" role="alert"
+                class="hidden flex-col gap-1.5 text-sm rounded-lg px-3 py-2 bg-amber-50 dark:bg-amber-900/20 text-amber-900 dark:text-amber-100 ring-1 ring-amber-400/50">
+                <div class="flex items-start gap-2">
+                    <i class="fas fa-exclamation-triangle shrink-0 mt-0.5" aria-hidden="true"></i>
+                    <span id="notice-mycomap-rename-text" class="min-w-0 flex-1 font-medium"></span>
+                    <button type="button" id="btn-dismiss-mycomap-rename-notice"
+                        class="shrink-0 p-1 rounded text-amber-800/70 hover:text-amber-900 hover:bg-amber-100 dark:text-amber-100/70 dark:hover:text-amber-50 dark:hover:bg-amber-900/40"
+                        title="Dismiss this notice" aria-label="Dismiss this notice">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <ul id="notice-mycomap-rename-list" class="ml-6 space-y-0.5 text-xs max-h-64 overflow-y-auto break-words"></ul>
+                <div id="notice-mycomap-rename-extra" class="ml-6 text-xs"></div>
+                <div id="notice-mycomap-rename-actions" class="ml-6 flex flex-wrap gap-2">
+                    <button type="button" id="btn-copy-mycomap-rename-list"
+                        class="text-xs px-2 py-1 rounded ring-1 ring-amber-400/60 hover:bg-amber-100 dark:hover:bg-amber-900/40">
+                        <i class="fas fa-copy mr-1"></i>Copy full list
+                    </button>
+                    <button type="button" id="btn-download-mycomap-rename-list"
+                        class="text-xs px-2 py-1 rounded ring-1 ring-amber-400/60 hover:bg-amber-100 dark:hover:bg-amber-900/40">
+                        <i class="fas fa-download mr-1"></i>Download list
+                    </button>
+                </div>
+            </div>
         </div>
         <div id="tree-mobile-toolbar" class="tree-mobile-only" aria-label="Tree navigation controls">
             <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-fit" aria-label="Fit tree">
@@ -1740,7 +1767,7 @@
 
 <script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=9"></script>
 
-<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=121"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=124"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

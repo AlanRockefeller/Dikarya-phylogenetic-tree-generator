@@ -2855,6 +2855,122 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
     }
 
+    // Alan 11/17/26 - Persistent notice for sequences MycoMap.org refreshed but did not
+    // rename (API keys cannot rename since 2026-11-12). A toast disappears, and each line
+    // here is work a curator still has to do on MycoMap.org. textContent/createElement only.
+    let mycomapRenameList = [];
+    function mycomapRenameTsv() {
+        const rows = [['observation', 'sequence_id', 'current_name', 'observation_name', 'admin_url'].join('\t')];
+        mycomapRenameList.forEach((seq) => rows.push([seq.reference, seq.sequence_id, seq.current_name,
+            seq.target_name, seq.url].map((value) => String(value || '').replace(/[\t\r\n]+/g, ' ')).join('\t')));
+        return rows.join('\n') + '\n';
+    }
+    // Alan 11/17/26 - Observations still listed (unreadable ones too) and which were refused,
+    // kept across refreshes so a later refresh of other records does not drop them.
+    let mycomapRenameUnlisted = [];
+    let mycomapRenameRefused = new Set();
+    // Alan 11/17/26 - Mirrors hand_rename_warning() in mycomap_org_service.py.
+    function mycomapRenameMessage(count, refused) {
+        const records = `${count} record${count === 1 ? '' : 's'} ${count === 1 ? 'was' : 'were'}`;
+        const their = count === 1 ? 'its' : 'their';
+        const cause = refused
+            ? `but MycoMap.org did not rename ${their} sequences (API keys can't rename)`
+            : `but MycoMap.org did not rename all of ${their} sequences`;
+        return `${records} refreshed, ${cause}. Sign in on MycoMap.org and use Refresh on each record's row to rename them:`;
+    }
+    function hideMycomapRenameNotice() {
+        const row = getEl('notice-mycomap-rename');
+        if (row) { row.classList.add('hidden'); row.classList.remove('flex'); }
+    }
+    // Alan 11/17/26 - Reconcile with what this refresh checked (CodeRabbit, PR #35): entries
+    // for the refreshed observations are replaced by this answer, so one a curator has since
+    // fixed disappears; entries for observations this refresh did not check are kept.
+    function showMycomapRenameNotice(warning, refreshedReferences) {
+        const row = getEl('notice-mycomap-rename');
+        const text = getEl('notice-mycomap-rename-text');
+        const list = getEl('notice-mycomap-rename-list');
+        const extra = getEl('notice-mycomap-rename-extra');
+        const actions = getEl('notice-mycomap-rename-actions');
+        if (!row || !text || !list || !extra) return;
+        const checked = new Set(Array.isArray(refreshedReferences) ? refreshedReferences : []);
+        const fresh = warning && Array.isArray(warning.sequences) ? warning.sequences : [];
+        const freshUnlisted = warning && Array.isArray(warning.unlisted_references) ? warning.unlisted_references : [];
+        fresh.forEach((seq) => checked.add(seq.reference));
+        // Alan 11/17/26 - An observation that could not be read back is NOT checked: keep its
+        // last-known entries (CodeRabbit, PR #35); it is listed as unread only when none are known.
+        freshUnlisted.forEach((ref) => checked.delete(ref));
+        mycomapRenameList = mycomapRenameList.filter((seq) => !checked.has(seq.reference)).concat(fresh);
+        const known = new Set(mycomapRenameList.map((seq) => seq.reference));
+        mycomapRenameUnlisted = Array.from(new Set(mycomapRenameUnlisted.filter((ref) => !checked.has(ref))
+            .concat(freshUnlisted))).filter((ref) => !known.has(ref));
+        checked.forEach((ref) => mycomapRenameRefused.delete(ref));
+        (warning && Array.isArray(warning.refused_references) ? warning.refused_references : [])
+            .forEach((ref) => mycomapRenameRefused.add(ref));
+        const observations = new Set(mycomapRenameList.map((seq) => seq.reference).concat(mycomapRenameUnlisted));
+        // Alan 11/17/26 - Nothing left to rename: hide the notice; nothing refused ever shows nothing.
+        if (!observations.size) {
+            hideMycomapRenameNotice();
+            return;
+        }
+        const limit = Number(warning && warning.display_limit) || 50;
+        text.textContent = mycomapRenameMessage(observations.size,
+            Array.from(observations).some((ref) => mycomapRenameRefused.has(ref)));
+        list.replaceChildren();
+        mycomapRenameList.slice(0, limit).forEach((seq) => {
+            const item = document.createElement('li');
+            item.appendChild(document.createTextNode(
+                `${seq.reference} · sequence ${seq.sequence_id}: ${seq.current_name || '(no name)'} → ${seq.target_name} `));
+            if (seq.url && /^https:\/\//.test(seq.url)) {
+                const link = document.createElement('a');
+                link.href = seq.url;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.className = 'underline decoration-dotted hover:text-journal-gold font-medium';
+                link.textContent = 'Open on MycoMap.org';
+                item.appendChild(link);
+            }
+            list.appendChild(item);
+        });
+        list.classList.toggle('hidden', mycomapRenameList.length === 0);
+        const notes = [];
+        if (mycomapRenameList.length > limit) {
+            notes.push(`Showing the first ${limit} of ${mycomapRenameList.length} sequences; copy or download the full list.`);
+        }
+        const unlisted = mycomapRenameUnlisted;
+        if (unlisted.length) {
+            notes.push(`Could not read the sequences of ${unlisted.join(', ')} from MycoMap.org; open ${unlisted.length === 1 ? 'that record' : 'those records'} there to check them.`);
+        }
+        extra.textContent = notes.join(' ');
+        extra.classList.toggle('hidden', notes.length === 0);
+        if (actions) actions.classList.toggle('hidden', mycomapRenameList.length === 0);
+        row.classList.remove('hidden');
+        row.classList.add('flex');
+        const wrap = getEl('tree-notices');
+        if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
+    }
+    // Alan 11/17/26 - Dismiss, copy and download controls for the rename notice.
+    getEl('btn-dismiss-mycomap-rename-notice')?.addEventListener('click', hideMycomapRenameNotice);
+    getEl('btn-copy-mycomap-rename-list')?.addEventListener('click', async () => {
+        try {
+            await copyTextToClipboard(mycomapRenameTsv());
+            showStatus('Rename list copied.', 'success', 1500);
+        } catch (err) {
+            console.error(err);
+            showStatus('Copy failed.', 'danger', 2500);
+        }
+    });
+    getEl('btn-download-mycomap-rename-list')?.addEventListener('click', () => {
+        const blob = new Blob([mycomapRenameTsv()], { type: 'text/tab-separated-values' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `mycomap-sequences-to-rename-${JOB_ID}.tsv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+
     // Alan 9/23/26 - One place that points the Root menu at the persisted rooting. Called on
     // every load, after a rooting change that did not happen (the menu would otherwise keep
     // showing the choice that failed) and when manual rerooting is cancelled.
@@ -4473,11 +4589,20 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const warningText = warningCount
                         ? ` ${String(result.warnings[0])}${warningCount > 1 ? ` (+${warningCount - 1} more warning${warningCount === 2 ? '' : 's'})` : ''}`
                         : '';
+                    // Alan 11/17/26 - Sequences MycoMap.org did not rename go in a persistent
+                    // notice above the tree; the toast only points at it.
+                    const renameWarning = result.sequence_rename_warning || null;
+                    // Alan 11/17/26 - Pass what was refreshed so resolved entries drop out.
+                    showMycomapRenameNotice(renameWarning, result.refreshed_references);
+                    const renameText = renameWarning
+                        ? ' MycoMap.org did not rename some sequences; see the notice above the tree.'
+                        : '';
+                    const warned = warningCount || renameWarning;
                     return {
                         finalStatus: {
-                            msg: refreshedText + updatedText + warningText,
-                            type: warningCount ? 'warning' : 'success',
-                            timeout: warningCount ? 6000 : 3000
+                            msg: refreshedText + updatedText + renameText + warningText,
+                            type: warned ? 'warning' : 'success',
+                            timeout: warned ? 6000 : 3000
                         }
                     };
                 }, { clearSelections: false });

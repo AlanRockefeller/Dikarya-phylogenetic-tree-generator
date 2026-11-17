@@ -15,8 +15,10 @@ from app.services.api_diagnostics import diagnostic_urlopen
 from app.services.fasta_utils import is_genbank_accession, parse_fasta_records
 
 logger = logging.getLogger(__name__)
-ORG_API = "https://mycomap.org/api/mycoblast"
-ORG_API_ROOT = "https://mycomap.org/api"
+# Alan 11/17/26 - One site root, so the admin page links below share the API's host.
+ORG_SITE = "https://mycomap.org"
+ORG_API = f"{ORG_SITE}/api/mycoblast"
+ORG_API_ROOT = f"{ORG_SITE}/api"
 MAX_XML_BYTES = 16 * 1024 * 1024
 MAX_JSON_BYTES = 2 * 1024 * 1024
 NCBI_BATCH_SIZE = 50
@@ -996,12 +998,13 @@ REFRESH_WORKERS = 3
 OBSERVATION_BATCH_SIZE = 50
 
 
-def observation_records(references, *, deadline=None):
-    """The name and location MycoMap.org holds for each inat:/mo: reference.
+def observation_rows(references, *, deadline=None):
+    """Every public sequence row MycoMap.org holds for each inat:/mo: reference.
 
     sequences/batch?observations= is public and returns one row per sequence,
-    so an observation with several sequences comes back several times; the
-    lowest sequence id wins, so a before/after pair always compares one row.
+    so an observation with several sequences comes back several times. Rows
+    are sorted by sequence id; every requested reference gets a (possibly
+    empty) list, so a caller can tell "read, none found" from "not read".
     """
     rows = []
     for offset in range(0, len(references), OBSERVATION_BATCH_SIZE):
@@ -1009,15 +1012,37 @@ def observation_records(references, *, deadline=None):
         payload = _json(f"mycomap/sequences/batch?observations={query}", deadline=deadline)
         rows.extend(row for row in payload.get("sequences") or [] if isinstance(row, dict))
     rows.sort(key=lambda row: _number(row.get("id")))
-    by_reference = {}
+    # A sequence linked to both an iNat and an MO observation can come back in
+    # two batches; keep one copy so it is never listed twice.
+    unique_rows, seen_ids = [], set()
     for row in rows:
+        sequence_id = str(row.get("id") or "").strip()
+        if sequence_id:
+            if sequence_id in seen_ids:
+                continue
+            seen_ids.add(sequence_id)
+        unique_rows.append(row)
+    by_reference = {reference: [] for reference in references}
+    for row in unique_rows:
         for prefix, key in (("inat", "inatObservationId"), ("mo", "moObservationId")):
             value = str(row.get(key) or "").strip()
-            if value.isdigit():
-                by_reference.setdefault(f"{prefix}:{value}", row)
+            if value.isdigit() and f"{prefix}:{value}" in by_reference:
+                by_reference[f"{prefix}:{value}"].append(row)
+    return by_reference
+
+
+def observation_records(references, *, deadline=None, rows_by_reference=None):
+    """The name and location MycoMap.org holds for each inat:/mo: reference.
+
+    The lowest sequence id wins, so a before/after pair always compares one
+    row. ``rows_by_reference`` (from :func:`observation_rows`) reuses rows
+    already read instead of asking MycoMap.org again.
+    """
+    if rows_by_reference is None:
+        rows_by_reference = observation_rows(references, deadline=deadline)
     summaries = {}
     for reference in references:
-        row = by_reference.get(reference)
+        row = (rows_by_reference.get(reference) or [None])[0]
         summaries[reference] = {
             "found": row is not None,
             "scientific_name": str((row or {}).get("scientificName") or "").strip(),
@@ -1082,12 +1107,80 @@ def _sequence_name_entries(value):
     return []
 
 
+_SESSION_SEQUENCE_NAME_KEYS = ("renamed", "skipped", "failed")
+
+
+def _is_session_sequence_names(value):
+    """sequenceNames in the {target, renamed, skipped, failed, note} shape.
+
+    That is the shape a signed-in session's refresh answers with. Read as the
+    older per-sequence list keyed by id, its ``target`` dict was counted as a
+    renamed sequence, so every such refresh reported one rename too many.
+    """
+    return isinstance(value, dict) and (
+        isinstance(value.get("target"), dict)
+        or any(isinstance(value.get(key), list) for key in _SESSION_SEQUENCE_NAME_KEYS))
+
+
+def _summarize_session_sequence_names(value):
+    def entries(key):
+        return [entry for entry in value.get(key) or [] if isinstance(entry, dict)]
+
+    skipped = {}
+    for entry in entries("skipped"):
+        reason = _clean_text(entry.get("reason"), 40).lower() or "unspecified"
+        skipped[reason] = skipped.get(reason, 0) + 1
+    target = value.get("target") if isinstance(value.get("target"), dict) else {}
+    return {
+        "renamed": len(entries("renamed")),
+        "skipped": skipped,
+        "failed": [_clean_text(entry.get("id"), 20) for entry in entries("failed")],
+        "note": _clean_text(value.get("note"), 300),
+        "target_name": _clean_text(target.get("name")),
+    }
+
+
 def summarize_refresh_response(payload):
-    """What a refresh with renameSequences did to the observation's sequences."""
+    """What a refresh with renameSequences did to the observation's sequences.
+
+    Since 2026-11-12 MycoMap.org never renames for an API key: the refresh
+    still succeeds, ``renameSequences`` is ignored, and the answer carries
+    ``sequenceNamesRefused``. ``names_refused`` records its code, and
+    ``needs_hand_rename`` marks an observation whose sequences a curator has
+    to rename on MycoMap.org (refused, or a session answer with failures or a
+    note).
+    """
     payload = payload if isinstance(payload, dict) else {}
+    refused = payload.get("sequenceNamesRefused")
+    if isinstance(refused, dict):
+        names_refused = _clean_text(refused.get("code"), 60) or "refused"
+    else:
+        names_refused = "refused" if refused else ""
+    local_sync = payload.get("localSync") if isinstance(payload.get("localSync"), dict) else {}
+    name_repair = payload.get("nameRepair") if isinstance(payload.get("nameRepair"), dict) else {}
+    common = {
+        "old_name": _clean_text(local_sync.get("oldName")),
+        "new_name": _clean_text(local_sync.get("newName")),
+        "name_repair_warning": _clean_text(name_repair.get("warning"), 300),
+        "names_refused": names_refused,
+    }
+    sequence_names = payload.get("sequenceNames")
+    if _is_session_sequence_names(sequence_names):
+        summary = {**_summarize_session_sequence_names(sequence_names), **common}
+    else:
+        summary = {**_summarize_legacy_sequence_names(sequence_names), **common}
+    if names_refused:
+        # A refused answer renamed nothing, whatever else it lists.
+        summary["renamed"] = 0
+    summary["needs_hand_rename"] = bool(
+        names_refused or summary["failed"] or summary["note"])
+    return summary
+
+
+def _summarize_legacy_sequence_names(value):
     renamed = 0
     skipped = {}
-    for entry in _sequence_name_entries(payload.get("sequenceNames")):
+    for entry in _sequence_name_entries(value):
         reason = _clean_text(entry.get("reason") or entry.get("skipReason"), 40).lower()
         status = _clean_text(entry.get("status"), 40).lower()
         if not reason and (entry.get("renamed") is False
@@ -1097,15 +1190,8 @@ def summarize_refresh_response(payload):
             skipped[reason] = skipped.get(reason, 0) + 1
         else:
             renamed += 1
-    local_sync = payload.get("localSync") if isinstance(payload.get("localSync"), dict) else {}
-    name_repair = payload.get("nameRepair") if isinstance(payload.get("nameRepair"), dict) else {}
-    return {
-        "renamed": renamed,
-        "skipped": skipped,
-        "old_name": _clean_text(local_sync.get("oldName")),
-        "new_name": _clean_text(local_sync.get("newName")),
-        "name_repair_warning": _clean_text(name_repair.get("warning"), 300),
-    }
+    return {"renamed": renamed, "skipped": skipped, "failed": [], "note": "",
+            "target_name": ""}
 
 
 def _refresh_observation(reference, deadline):
@@ -1126,9 +1212,11 @@ def _refresh_observation(reference, deadline):
     summary = summarize_refresh_response(payload)
     logger.info(
         "event=mycomap_org.refresh_result reference=%s renamed=%s skipped=%s "
+        "failed=%s names_refused=%s note=%r "
         "local_old=%r local_new=%r name_repair_warning=%r",
         reference, summary["renamed"],
         ",".join(f"{k}:{v}" for k, v in sorted(summary["skipped"].items())) or "-",
+        len(summary["failed"]), summary["names_refused"] or "-", summary["note"] or "-",
         summary["old_name"] or "-", summary["new_name"] or "-",
         summary["name_repair_warning"] or "-",
     )
@@ -1152,7 +1240,7 @@ def _refresh_notes(reference, summary):
     return notes
 
 
-def refresh_observations(references, not_refreshed=None):
+def refresh_observations(references, not_refreshed=None, rename_pending=None):
     """Refresh observations from their source and rename their sequences.
 
     Mirrors MycoMap.org's own Refresh button: admin/mycomap/refresh with
@@ -1163,6 +1251,10 @@ def refresh_observations(references, not_refreshed=None):
     a list of warnings; raises OrgResultError only when nothing could be
     refreshed. When ``not_refreshed`` is a list, every reference that was not
     refreshed (failed, or never attempted after a 429) is appended to it.
+    When ``rename_pending`` is a dict, every refreshed reference whose
+    sequences MycoMap.org did not rename (see summarize_refresh_response) is
+    added to it with its summary; pass it to :func:`sequences_needing_rename`.
+    Such a reference was still refreshed and is never in ``not_refreshed``.
     """
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -1238,6 +1330,8 @@ def refresh_observations(references, not_refreshed=None):
     for reference in references:
         if reference in summaries:
             warnings.extend(_refresh_notes(reference, summaries[reference]))
+            if rename_pending is not None and summaries[reference]["needs_hand_rename"]:
+                rename_pending[reference] = summaries[reference]
 
     # Nothing refreshed because the key was refused or the route is rate
     # limited: say so plainly (the route maps a 429 to 429 + Retry-After)
@@ -1260,6 +1354,122 @@ def refresh_observations(references, not_refreshed=None):
             raise
         logger.warning("event=mycomap_org.sync_failed count=%s", len(references), exc_info=True)
     return warnings
+
+
+# Alan 11/17/26 - Sequences MycoMap.org did not rename, for a curator to fix by hand.
+HAND_RENAME_DISPLAY_LIMIT = 50
+
+
+def _comparable_name(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _observation_number(value):
+    """Digits of an iNat/MO observation id ("MO12345" -> "12345"), or ""."""
+    match = re.search(r"\d{1,12}", str(value or ""))
+    return match.group(0) if match else ""
+
+
+def admin_blast_url(row):
+    """MycoMap.org's admin BLAST page for one sequence row, or "".
+
+    A signed-in curator's Refresh on that page renames the sequence. The path
+    takes the iNat number, else the MO number, else 0.
+    """
+    sequence_id = str(row.get("id") or "").strip()
+    if not re.fullmatch(r"\d{1,12}", sequence_id):
+        return ""
+    observation = (_observation_number(row.get("inatObservationId"))
+                   or _observation_number(row.get("moObservationId")) or "0")
+    return f"{ORG_SITE}/admin/blast-results/{observation}/{sequence_id}"
+
+
+def sequences_needing_rename(rename_pending, rows_by_reference=None, *, deadline=None,
+                             reread=True):
+    """List the sequences of each ``rename_pending`` observation still misnamed.
+
+    ``rows_by_reference`` is the post-refresh read the caller already made
+    (:func:`observation_rows`); only references missing from it are read
+    again, unless ``reread`` is False (the caller's own read just failed), in
+    which case they are reported as unread. A sequence is listed when its scientificName differs from the
+    observation's refreshed name (``sequenceNames.target.name``, else the
+    row's ``inatReportCachedName``, else localSync's new name). An
+    observation that could not be read, or whose name is unknown, is still
+    returned with ``listed`` False; one whose sequences all match is dropped.
+    """
+    if not rename_pending:
+        return []
+    rows_by_reference = dict(rows_by_reference or {})
+    unread = [ref for ref in rename_pending if ref not in rows_by_reference]
+    lookup_failed = set()
+    if unread and not reread:
+        lookup_failed.update(unread)
+    elif unread:
+        try:
+            rows_by_reference.update(observation_rows(unread, deadline=deadline))
+        except OrgResultError:
+            logger.warning("event=mycomap_org.hand_rename_lookup_failed count=%s",
+                           len(unread), exc_info=True)
+            lookup_failed.update(unread)
+    observations = []
+    for reference, summary in rename_pending.items():
+        rows = rows_by_reference.get(reference) or []
+        target = summary.get("target_name") or next(
+            (_clean_text(row.get("inatReportCachedName")) for row in rows
+             if _clean_text(row.get("inatReportCachedName"))), "") or summary.get("new_name") or ""
+        item = {
+            "reference": reference,
+            "target_name": target,
+            "code": summary.get("names_refused") or "",
+            "listed": reference not in lookup_failed and bool(target),
+            "sequences": [],
+        }
+        if item["listed"]:
+            for row in rows:
+                current = _clean_text(row.get("scientificName"))
+                if _comparable_name(current) == _comparable_name(target):
+                    continue
+                item["sequences"].append({
+                    "reference": reference,
+                    "sequence_id": _clean_text(row.get("id"), 20),
+                    "current_name": current,
+                    "target_name": target,
+                    "url": admin_blast_url(row),
+                })
+            if not item["sequences"]:
+                continue
+        observations.append(item)
+    return observations
+
+
+def hand_rename_warning(observations):
+    """The user-facing block for :func:`sequences_needing_rename`, or None."""
+    if not observations:
+        return None
+    count = len(observations)
+    refused = any(item["code"] for item in observations)
+    records = f"{count} record{'' if count == 1 else 's'} {'was' if count == 1 else 'were'}"
+    their = "its" if count == 1 else "their"
+    if refused:
+        cause = (f"but MycoMap.org did not rename {their} sequences "
+                 "(API keys can't rename)")
+    else:
+        cause = f"but MycoMap.org did not rename all of {their} sequences"
+    message = (f"{records} refreshed, {cause}. Sign in on MycoMap.org and use "
+               "Refresh on each record's row to rename them:")
+    sequences = [seq for item in observations for seq in item["sequences"]]
+    return {
+        "message": message,
+        "observation_count": count,
+        "sequence_count": len(sequences),
+        "display_limit": HAND_RENAME_DISPLAY_LIMIT,
+        "sequences": sequences,
+        # Observations whose sequences could not be read or compared.
+        "unlisted_references": [item["reference"] for item in observations
+                                if not item["listed"]],
+        "refused_references": [item["reference"] for item in observations
+                               if item["code"]],
+    }
 
 
 def fetch_results(result_id, *, include_ncbi=True, include_local=True,
