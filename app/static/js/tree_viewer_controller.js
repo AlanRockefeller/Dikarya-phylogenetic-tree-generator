@@ -2896,9 +2896,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         const fresh = warning && Array.isArray(warning.sequences) ? warning.sequences : [];
         const freshUnlisted = warning && Array.isArray(warning.unlisted_references) ? warning.unlisted_references : [];
         fresh.forEach((seq) => checked.add(seq.reference));
-        freshUnlisted.forEach((ref) => checked.add(ref));
+        // Alan 11/17/26 - An observation that could not be read back is NOT checked: keep its
+        // last-known entries (CodeRabbit, PR #35); it is listed as unread only when none are known.
+        freshUnlisted.forEach((ref) => checked.delete(ref));
         mycomapRenameList = mycomapRenameList.filter((seq) => !checked.has(seq.reference)).concat(fresh);
-        mycomapRenameUnlisted = mycomapRenameUnlisted.filter((ref) => !checked.has(ref)).concat(freshUnlisted);
+        const known = new Set(mycomapRenameList.map((seq) => seq.reference));
+        mycomapRenameUnlisted = Array.from(new Set(mycomapRenameUnlisted.filter((ref) => !checked.has(ref))
+            .concat(freshUnlisted))).filter((ref) => !known.has(ref));
         checked.forEach((ref) => mycomapRenameRefused.delete(ref));
         (warning && Array.isArray(warning.refused_references) ? warning.refused_references : [])
             .forEach((ref) => mycomapRenameRefused.add(ref));

@@ -74,7 +74,10 @@ def test_route_passes_the_sequence_rename_warning_through(setup, monkeypatch):
                "unlisted_references": ["inat:154644100"]}
 
     def refresh(references):
-        return {"references": references, "before": {}, "after": {}, "warnings": [],
+        return {"references": references, "before": {},
+                "after": {"inat:154644100": {"found": True, "scientific_name": "Podaxis inyoensis",
+                                             "location": ""}},
+                "warnings": [],
                 "not_refreshed": [], "sequence_rename_warning": warning, "message": ""}
 
     monkeypatch.setattr(mycomap_service, "refresh_mycomap_observation_records", refresh)
@@ -86,3 +89,19 @@ def test_route_passes_the_sequence_rename_warning_through(setup, monkeypatch):
     assert body["refreshed_references"] == ["inat:154644100"]
     # Refused renames are not refresh failures.
     assert body["refreshed_count"] == 1
+
+
+def test_route_does_not_report_an_unread_observation_as_checked(setup, monkeypatch):
+    """A failed read-back leaves "after" empty; the viewer must keep its known entries."""
+    client, job_id, _calls = setup
+
+    def refresh(references):
+        return {"references": references, "before": {}, "after": {}, "warnings": [],
+                "not_refreshed": [], "sequence_rename_warning": None, "message": ""}
+
+    monkeypatch.setattr(mycomap_service, "refresh_mycomap_observation_records", refresh)
+    response = client.post(f"/api/job/{job_id}/tree/refresh-mycomap-records",
+                           json={"tip_names": [INAT_TIP]})
+    body = response.get_json()
+    assert body["refreshed_count"] == 1
+    assert body["refreshed_references"] == []
