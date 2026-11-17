@@ -2855,6 +2855,86 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
     }
 
+    // Alan 11/17/26 - Persistent notice for sequences MycoMap.org refreshed but did not
+    // rename (API keys cannot rename since 2026-11-12). A toast disappears, and each line
+    // here is work a curator still has to do on MycoMap.org. textContent/createElement only.
+    let mycomapRenameList = [];
+    function mycomapRenameTsv() {
+        const rows = [['observation', 'sequence_id', 'current_name', 'observation_name', 'admin_url'].join('\t')];
+        mycomapRenameList.forEach((seq) => rows.push([seq.reference, seq.sequence_id, seq.current_name,
+            seq.target_name, seq.url].map((value) => String(value || '').replace(/[\t\r\n]+/g, ' ')).join('\t')));
+        return rows.join('\n') + '\n';
+    }
+    function showMycomapRenameNotice(warning) {
+        const row = getEl('notice-mycomap-rename');
+        const text = getEl('notice-mycomap-rename-text');
+        const list = getEl('notice-mycomap-rename-list');
+        const extra = getEl('notice-mycomap-rename-extra');
+        const actions = getEl('notice-mycomap-rename-actions');
+        // Alan 11/17/26 - Nothing refused: leave any earlier notice alone and add nothing.
+        if (!row || !text || !list || !extra || !warning || !warning.message) return;
+        mycomapRenameList = Array.isArray(warning.sequences) ? warning.sequences : [];
+        const limit = Number(warning.display_limit) || 50;
+        text.textContent = String(warning.message);
+        list.replaceChildren();
+        mycomapRenameList.slice(0, limit).forEach((seq) => {
+            const item = document.createElement('li');
+            item.appendChild(document.createTextNode(
+                `${seq.reference} · sequence ${seq.sequence_id}: ${seq.current_name || '(no name)'} → ${seq.target_name} `));
+            if (seq.url && /^https:\/\//.test(seq.url)) {
+                const link = document.createElement('a');
+                link.href = seq.url;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.className = 'underline decoration-dotted hover:text-journal-gold font-medium';
+                link.textContent = 'Open on MycoMap.org';
+                item.appendChild(link);
+            }
+            list.appendChild(item);
+        });
+        list.classList.toggle('hidden', mycomapRenameList.length === 0);
+        const notes = [];
+        if (mycomapRenameList.length > limit) {
+            notes.push(`Showing the first ${limit} of ${mycomapRenameList.length} sequences; copy or download the full list.`);
+        }
+        const unlisted = Array.isArray(warning.unlisted_references) ? warning.unlisted_references : [];
+        if (unlisted.length) {
+            notes.push(`Could not read the sequences of ${unlisted.join(', ')} from MycoMap.org; open ${unlisted.length === 1 ? 'that record' : 'those records'} there to check them.`);
+        }
+        extra.textContent = notes.join(' ');
+        extra.classList.toggle('hidden', notes.length === 0);
+        if (actions) actions.classList.toggle('hidden', mycomapRenameList.length === 0);
+        row.classList.remove('hidden');
+        row.classList.add('flex');
+        const wrap = getEl('tree-notices');
+        if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
+    }
+    // Alan 11/17/26 - Dismiss, copy and download controls for the rename notice.
+    getEl('btn-dismiss-mycomap-rename-notice')?.addEventListener('click', () => {
+        const row = getEl('notice-mycomap-rename');
+        if (row) { row.classList.add('hidden'); row.classList.remove('flex'); }
+    });
+    getEl('btn-copy-mycomap-rename-list')?.addEventListener('click', async () => {
+        try {
+            await copyTextToClipboard(mycomapRenameTsv());
+            showStatus('Rename list copied.', 'success', 1500);
+        } catch (err) {
+            console.error(err);
+            showStatus('Copy failed.', 'danger', 2500);
+        }
+    });
+    getEl('btn-download-mycomap-rename-list')?.addEventListener('click', () => {
+        const blob = new Blob([mycomapRenameTsv()], { type: 'text/tab-separated-values' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `mycomap-sequences-to-rename-${JOB_ID}.tsv`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+
     // Alan 9/23/26 - One place that points the Root menu at the persisted rooting. Called on
     // every load, after a rooting change that did not happen (the menu would otherwise keep
     // showing the choice that failed) and when manual rerooting is cancelled.
@@ -4473,11 +4553,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const warningText = warningCount
                         ? ` ${String(result.warnings[0])}${warningCount > 1 ? ` (+${warningCount - 1} more warning${warningCount === 2 ? '' : 's'})` : ''}`
                         : '';
+                    // Alan 11/17/26 - Sequences MycoMap.org did not rename go in a persistent
+                    // notice above the tree; the toast only points at it.
+                    const renameWarning = result.sequence_rename_warning || null;
+                    showMycomapRenameNotice(renameWarning);
+                    const renameText = renameWarning
+                        ? ' MycoMap.org did not rename some sequences; see the notice above the tree.'
+                        : '';
+                    const warned = warningCount || renameWarning;
                     return {
                         finalStatus: {
-                            msg: refreshedText + updatedText + warningText,
-                            type: warningCount ? 'warning' : 'success',
-                            timeout: warningCount ? 6000 : 3000
+                            msg: refreshedText + updatedText + renameText + warningText,
+                            type: warned ? 'warning' : 'success',
+                            timeout: warned ? 6000 : 3000
                         }
                     };
                 }, { clearSelections: false });

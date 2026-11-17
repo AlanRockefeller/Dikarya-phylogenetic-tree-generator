@@ -3866,6 +3866,8 @@ def refresh_tree_mycomap_records(job_id):
             "metadata_changes": metadata_changes,
             "warnings": (list(refresh_result.get("warnings") or []) + label_result["warnings"]
                          + metadata_warnings),
+            # Sequences MycoMap.org refreshed but did not rename; null when none.
+            "sequence_rename_warning": refresh_result.get("sequence_rename_warning"),
             "message": refresh_result.get("message") or "",
         })
     except MycoMapRefreshRateLimited as exc:

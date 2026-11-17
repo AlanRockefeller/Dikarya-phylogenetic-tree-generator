@@ -2220,20 +2220,28 @@ def refresh_mycomap_observation_records(references: list) -> dict:
     try:
         before = org.observation_records(normalized)
         not_refreshed = []
-        warnings = org.refresh_observations(normalized, not_refreshed=not_refreshed)
+        rename_pending = {}
+        warnings = org.refresh_observations(normalized, not_refreshed=not_refreshed,
+                                            rename_pending=rename_pending)
         # MycoMap.org's own button waits briefly before re-reading too.
         time.sleep(1)
-        after = org.observation_records(normalized)
+        after_rows = org.observation_rows(normalized)
+        after = org.observation_records(normalized, rows_by_reference=after_rows)
     except org.OrgResultError as exc:
         if exc.status == 429:
             raise MycoMapRefreshRateLimited(str(exc), exc.retry_after) from exc
         raise MycoMapRefreshError(str(exc)) from exc
+    # Alan 11/17/26 - MycoMap.org refreshes but never renames sequences for an API
+    # key, so list the ones a curator must rename by hand (from the read above).
+    sequence_rename_warning = org.hand_rename_warning(
+        org.sequences_needing_rename(rename_pending, after_rows))
     return {
         "references": normalized,
         "before": before,
         "after": after,
         "warnings": warnings,
         "not_refreshed": not_refreshed,
+        "sequence_rename_warning": sequence_rename_warning,
         "message": "",
     }
 
