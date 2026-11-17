@@ -3868,6 +3868,10 @@ def refresh_tree_mycomap_records(job_id):
                          + metadata_warnings),
             # Sequences MycoMap.org refreshed but did not rename; null when none.
             "sequence_rename_warning": refresh_result.get("sequence_rename_warning"),
+            # What this refresh checked, so the viewer can drop resolved entries.
+            "refreshed_references": [
+                ref for ref in references
+                if ref not in set(refresh_result.get("not_refreshed") or [])],
             "message": refresh_result.get("message") or "",
         })
     except MycoMapRefreshRateLimited as exc:

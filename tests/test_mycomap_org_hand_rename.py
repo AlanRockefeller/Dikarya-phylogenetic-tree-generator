@@ -42,15 +42,22 @@ def _row(seq_id, name, inat=None, mo=None, cached=ENTOLOMA):
             "moObservationId": mo, "inatReportCachedName": cached}
 
 
-def _fake_mycomap(rows, refresh_answers, batch_reads=None, http_error=None):
-    """urlopen stub: sequences/batch answers from ``rows``, refresh from ``refresh_answers``."""
+def _fake_mycomap(rows, refresh_answers, batch_reads=None, http_error=None,
+                  fail_batch_reads_from=None):
+    """urlopen stub: sequences/batch answers from ``rows``, refresh from ``refresh_answers``.
+
+    ``fail_batch_reads_from`` makes the Nth sequences/batch read (0-based) and
+    every later one fail as if MycoMap.org were down.
+    """
+    reads = [] if batch_reads is None else batch_reads
 
     def urlopen(request, timeout):
         url = request.full_url
         if "/mycomap/sequences/batch" in url:
             refs = parse_qs(urlparse(url).query)["observations"][0].split(",")
-            if batch_reads is not None:
-                batch_reads.append(refs)
+            reads.append(refs)
+            if fail_batch_reads_from is not None and len(reads) > fail_batch_reads_from:
+                raise urllib.error.URLError("down")
             wanted = {r.split(":")[1] for r in refs}
             return _JsonResponse({"sequences": [
                 row for row in rows
@@ -236,3 +243,37 @@ def test_rename_pending_is_filled_only_for_refused_refreshes(monkeypatch):
                                  rename_pending=pending)
     assert list(pending) == ["inat:1"]
     assert not_refreshed == []
+
+
+def test_failed_reread_after_a_refused_refresh_keeps_the_refresh_and_the_warning(monkeypatch):
+    """Orchestration: refresh succeeds (refused renames), the read after it fails."""
+    rows = [_row(21681, "Entolomataceae", inat=50523564)]
+    reads = []
+    result = _refresh(monkeypatch, ["inat:50523564"], rows, {
+        "inat:50523564": {"sequenceNamesRefused": REFUSED},
+    }, batch_reads=reads, fail_batch_reads_from=1)
+
+    assert result["not_refreshed"] == []
+    assert result["after"] == {}
+    assert any("could not read them back" in w for w in result["warnings"])
+    warning = result["sequence_rename_warning"]
+    assert warning["sequences"] == []
+    assert warning["unlisted_references"] == ["inat:50523564"]
+    assert warning["refused_references"] == ["inat:50523564"]
+    # Before + the failed after-read; no third attempt for the list.
+    assert len(reads) == 2
+
+
+def test_sequence_returned_in_two_batches_is_listed_once(monkeypatch):
+    """A sequence linked to an iNat and an MO observation in different batches."""
+    shared = _row(77, "Agaricales", inat=1, mo=2)
+    responses = iter([[shared], [shared]])
+    monkeypatch.setattr(org, "OBSERVATION_BATCH_SIZE", 1)
+    monkeypatch.setattr(org, "_json", lambda *_a, **_k: {"sequences": next(responses)})
+    rows = org.observation_rows(["inat:1", "mo:2"])
+    assert [r["id"] for r in rows["inat:1"]] == [77]
+    assert [r["id"] for r in rows["mo:2"]] == [77]
+
+    pending = {"inat:1": {"names_refused": "X", "target_name": "Agaricus"}}
+    warning = org.hand_rename_warning(org.sequences_needing_rename(pending, rows))
+    assert warning["sequence_count"] == 1

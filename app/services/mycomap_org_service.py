@@ -1012,8 +1012,18 @@ def observation_rows(references, *, deadline=None):
         payload = _json(f"mycomap/sequences/batch?observations={query}", deadline=deadline)
         rows.extend(row for row in payload.get("sequences") or [] if isinstance(row, dict))
     rows.sort(key=lambda row: _number(row.get("id")))
-    by_reference = {reference: [] for reference in references}
+    # A sequence linked to both an iNat and an MO observation can come back in
+    # two batches; keep one copy so it is never listed twice.
+    unique_rows, seen_ids = [], set()
     for row in rows:
+        sequence_id = str(row.get("id") or "").strip()
+        if sequence_id:
+            if sequence_id in seen_ids:
+                continue
+            seen_ids.add(sequence_id)
+        unique_rows.append(row)
+    by_reference = {reference: [] for reference in references}
+    for row in unique_rows:
         for prefix, key in (("inat", "inatObservationId"), ("mo", "moObservationId")):
             value = str(row.get(key) or "").strip()
             if value.isdigit() and f"{prefix}:{value}" in by_reference:
@@ -1374,12 +1384,14 @@ def admin_blast_url(row):
     return f"{ORG_SITE}/admin/blast-results/{observation}/{sequence_id}"
 
 
-def sequences_needing_rename(rename_pending, rows_by_reference=None, *, deadline=None):
+def sequences_needing_rename(rename_pending, rows_by_reference=None, *, deadline=None,
+                             reread=True):
     """List the sequences of each ``rename_pending`` observation still misnamed.
 
     ``rows_by_reference`` is the post-refresh read the caller already made
     (:func:`observation_rows`); only references missing from it are read
-    again. A sequence is listed when its scientificName differs from the
+    again, unless ``reread`` is False (the caller's own read just failed), in
+    which case they are reported as unread. A sequence is listed when its scientificName differs from the
     observation's refreshed name (``sequenceNames.target.name``, else the
     row's ``inatReportCachedName``, else localSync's new name). An
     observation that could not be read, or whose name is unknown, is still
@@ -1390,7 +1402,9 @@ def sequences_needing_rename(rename_pending, rows_by_reference=None, *, deadline
     rows_by_reference = dict(rows_by_reference or {})
     unread = [ref for ref in rename_pending if ref not in rows_by_reference]
     lookup_failed = set()
-    if unread:
+    if unread and not reread:
+        lookup_failed.update(unread)
+    elif unread:
         try:
             rows_by_reference.update(observation_rows(unread, deadline=deadline))
         except OrgResultError:
@@ -1453,6 +1467,8 @@ def hand_rename_warning(observations):
         # Observations whose sequences could not be read or compared.
         "unlisted_references": [item["reference"] for item in observations
                                 if not item["listed"]],
+        "refused_references": [item["reference"] for item in observations
+                               if item["code"]],
     }
 
 

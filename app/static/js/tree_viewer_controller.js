@@ -2865,17 +2865,52 @@ document.addEventListener('DOMContentLoaded', async () => {
             seq.target_name, seq.url].map((value) => String(value || '').replace(/[\t\r\n]+/g, ' ')).join('\t')));
         return rows.join('\n') + '\n';
     }
-    function showMycomapRenameNotice(warning) {
+    // Alan 11/17/26 - Observations still listed (unreadable ones too) and which were refused,
+    // kept across refreshes so a later refresh of other records does not drop them.
+    let mycomapRenameUnlisted = [];
+    let mycomapRenameRefused = new Set();
+    // Alan 11/17/26 - Mirrors hand_rename_warning() in mycomap_org_service.py.
+    function mycomapRenameMessage(count, refused) {
+        const records = `${count} record${count === 1 ? '' : 's'} ${count === 1 ? 'was' : 'were'}`;
+        const their = count === 1 ? 'its' : 'their';
+        const cause = refused
+            ? `but MycoMap.org did not rename ${their} sequences (API keys can't rename)`
+            : `but MycoMap.org did not rename all of ${their} sequences`;
+        return `${records} refreshed, ${cause}. Sign in on MycoMap.org and use Refresh on each record's row to rename them:`;
+    }
+    function hideMycomapRenameNotice() {
+        const row = getEl('notice-mycomap-rename');
+        if (row) { row.classList.add('hidden'); row.classList.remove('flex'); }
+    }
+    // Alan 11/17/26 - Reconcile with what this refresh checked (CodeRabbit, PR #35): entries
+    // for the refreshed observations are replaced by this answer, so one a curator has since
+    // fixed disappears; entries for observations this refresh did not check are kept.
+    function showMycomapRenameNotice(warning, refreshedReferences) {
         const row = getEl('notice-mycomap-rename');
         const text = getEl('notice-mycomap-rename-text');
         const list = getEl('notice-mycomap-rename-list');
         const extra = getEl('notice-mycomap-rename-extra');
         const actions = getEl('notice-mycomap-rename-actions');
-        // Alan 11/17/26 - Nothing refused: leave any earlier notice alone and add nothing.
-        if (!row || !text || !list || !extra || !warning || !warning.message) return;
-        mycomapRenameList = Array.isArray(warning.sequences) ? warning.sequences : [];
-        const limit = Number(warning.display_limit) || 50;
-        text.textContent = String(warning.message);
+        if (!row || !text || !list || !extra) return;
+        const checked = new Set(Array.isArray(refreshedReferences) ? refreshedReferences : []);
+        const fresh = warning && Array.isArray(warning.sequences) ? warning.sequences : [];
+        const freshUnlisted = warning && Array.isArray(warning.unlisted_references) ? warning.unlisted_references : [];
+        fresh.forEach((seq) => checked.add(seq.reference));
+        freshUnlisted.forEach((ref) => checked.add(ref));
+        mycomapRenameList = mycomapRenameList.filter((seq) => !checked.has(seq.reference)).concat(fresh);
+        mycomapRenameUnlisted = mycomapRenameUnlisted.filter((ref) => !checked.has(ref)).concat(freshUnlisted);
+        checked.forEach((ref) => mycomapRenameRefused.delete(ref));
+        (warning && Array.isArray(warning.refused_references) ? warning.refused_references : [])
+            .forEach((ref) => mycomapRenameRefused.add(ref));
+        const observations = new Set(mycomapRenameList.map((seq) => seq.reference).concat(mycomapRenameUnlisted));
+        // Alan 11/17/26 - Nothing left to rename: hide the notice; nothing refused ever shows nothing.
+        if (!observations.size) {
+            hideMycomapRenameNotice();
+            return;
+        }
+        const limit = Number(warning && warning.display_limit) || 50;
+        text.textContent = mycomapRenameMessage(observations.size,
+            Array.from(observations).some((ref) => mycomapRenameRefused.has(ref)));
         list.replaceChildren();
         mycomapRenameList.slice(0, limit).forEach((seq) => {
             const item = document.createElement('li');
@@ -2897,7 +2932,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (mycomapRenameList.length > limit) {
             notes.push(`Showing the first ${limit} of ${mycomapRenameList.length} sequences; copy or download the full list.`);
         }
-        const unlisted = Array.isArray(warning.unlisted_references) ? warning.unlisted_references : [];
+        const unlisted = mycomapRenameUnlisted;
         if (unlisted.length) {
             notes.push(`Could not read the sequences of ${unlisted.join(', ')} from MycoMap.org; open ${unlisted.length === 1 ? 'that record' : 'those records'} there to check them.`);
         }
@@ -2910,10 +2945,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
     }
     // Alan 11/17/26 - Dismiss, copy and download controls for the rename notice.
-    getEl('btn-dismiss-mycomap-rename-notice')?.addEventListener('click', () => {
-        const row = getEl('notice-mycomap-rename');
-        if (row) { row.classList.add('hidden'); row.classList.remove('flex'); }
-    });
+    getEl('btn-dismiss-mycomap-rename-notice')?.addEventListener('click', hideMycomapRenameNotice);
     getEl('btn-copy-mycomap-rename-list')?.addEventListener('click', async () => {
         try {
             await copyTextToClipboard(mycomapRenameTsv());
@@ -4556,7 +4588,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // Alan 11/17/26 - Sequences MycoMap.org did not rename go in a persistent
                     // notice above the tree; the toast only points at it.
                     const renameWarning = result.sequence_rename_warning || null;
-                    showMycomapRenameNotice(renameWarning);
+                    // Alan 11/17/26 - Pass what was refreshed so resolved entries drop out.
+                    showMycomapRenameNotice(renameWarning, result.refreshed_references);
                     const renameText = renameWarning
                         ? ' MycoMap.org did not rename some sequences; see the notice above the tree.'
                         : '';

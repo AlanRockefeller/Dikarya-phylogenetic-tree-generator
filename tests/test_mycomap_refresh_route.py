@@ -83,5 +83,6 @@ def test_route_passes_the_sequence_rename_warning_through(setup, monkeypatch):
     assert response.status_code == 200, response.get_json()
     body = response.get_json()
     assert body["sequence_rename_warning"] == warning
+    assert body["refreshed_references"] == ["inat:154644100"]
     # Refused renames are not refresh failures.
     assert body["refreshed_count"] == 1

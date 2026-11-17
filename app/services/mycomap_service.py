@@ -2223,18 +2223,29 @@ def refresh_mycomap_observation_records(references: list) -> dict:
         rename_pending = {}
         warnings = org.refresh_observations(normalized, not_refreshed=not_refreshed,
                                             rename_pending=rename_pending)
-        # MycoMap.org's own button waits briefly before re-reading too.
-        time.sleep(1)
-        after_rows = org.observation_rows(normalized)
-        after = org.observation_records(normalized, rows_by_reference=after_rows)
     except org.OrgResultError as exc:
         if exc.status == 429:
             raise MycoMapRefreshRateLimited(str(exc), exc.retry_after) from exc
         raise MycoMapRefreshError(str(exc)) from exc
+    # MycoMap.org's own button waits briefly before re-reading too.
+    time.sleep(1)
+    # Alan 11/17/26 - The records were refreshed by now, so a failed re-read must
+    # not turn that into a 502 (or drop the rename warning): with no "after" no
+    # tip label changes, and each tip says MycoMap returned no refreshed details.
+    try:
+        after_rows = org.observation_rows(normalized)
+        after = org.observation_records(normalized, rows_by_reference=after_rows)
+    except org.OrgResultError:
+        logger.warning("event=mycomap_org.refresh_reread_failed count=%s",
+                       len(normalized), exc_info=True)
+        after_rows, after = {}, {}
+        warnings = list(warnings) + [
+            "MycoMap.org refreshed the records, but Dikarya could not read them back "
+            "afterwards, so tree labels were left as they are; refresh again shortly."]
     # Alan 11/17/26 - MycoMap.org refreshes but never renames sequences for an API
     # key, so list the ones a curator must rename by hand (from the read above).
     sequence_rename_warning = org.hand_rename_warning(
-        org.sequences_needing_rename(rename_pending, after_rows))
+        org.sequences_needing_rename(rename_pending, after_rows, reread=False))
     return {
         "references": normalized,
         "before": before,
